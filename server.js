@@ -419,6 +419,75 @@ Return ONLY this JSON array — no markdown, no preamble, no trailing text:
 [{"q":"question text","options":{"A":"","B":"","C":"","D":""},"answer":"A","explanation":"brief marking-scheme explanation","topic":"syllabus topic","year":"${year||"20XX"}","difficulty":"easy|medium|hard","source":"AI"}]`;
 };
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// ENGLISH LANGUAGE SPECIALIST GENERATOR
+// ALOC has no comprehension passages — AI generates full passage + linked questions
+// English is split: 60% AI (comprehension+summary), 40% ALOC (lexis+oral+vocab)
+// ═══════════════════════════════════════════════════════════════════════════════
+const ENGLISH_SUBJECTS = ["english", "english language", "use of english"];
+const isEnglish = (subject) => ENGLISH_SUBJECTS.includes((subject||"").toLowerCase());
+
+const generateEnglishComprehension = async (examType, year, count) => {
+  const examLabel = examType === "utme" ? "JAMB" : "WAEC";
+  const passageCount = Math.ceil(count / 5); // one passage per ~5 questions
+
+  const prompt = `Generate ${passageCount} English comprehension passage(s) with questions for ${examLabel}${year?" "+year:""} exam.
+
+${NG_CONTEXT}
+
+For EACH passage:
+1. Write a 150-200 word passage on a Nigerian topic (education, culture, environment, economy, governance)
+2. Generate 4-6 MCQ questions directly based on the passage
+3. Include: 2 factual recall, 2 inference/interpretation, 1 vocabulary-in-context, 1 summary question
+
+Also generate these standalone question types (no passage needed):
+- ${Math.floor(count * 0.2)} Lexis & Structure questions (fill-in-the-gap, sentence completion)
+- ${Math.floor(count * 0.1)} Oral English questions (vowel sounds, consonants, rhymes, stress patterns)
+- ${Math.floor(count * 0.1)} Vocabulary questions (synonyms, antonyms, word usage)
+
+IMPORTANT: For passage questions, include a "passage" field with the full text.
+Questions referencing a passage MUST include the passage text in each question object.
+
+Return ONLY this JSON array:
+[{
+  "q": "question text (for comprehension: include instruction like 'According to the passage, ...')",
+  "passage": "full passage text here (only for comprehension questions, omit for standalone)",
+  "options": {"A": "", "B": "", "C": "", "D": ""},
+  "answer": "A",
+  "explanation": "explanation referencing the passage or rule",
+  "topic": "Comprehension|Lexis & Structure|Oral English|Vocabulary",
+  "year": "${year||"20XX"}",
+  "difficulty": "easy|medium|hard",
+  "source": "AI"
+}]`;
+
+  const system = `You are a ${examLabel} English Language examiner. Follow the official ${examLabel} English syllabus. ${NG_CONTEXT}`;
+
+  const chain = [
+    {name:"Gemini",   key:GEMINI_KEY,    fn:()=>callGemini(prompt,system)},
+    {name:"Claude",   key:ANTHROPIC_KEY, fn:()=>callClaude(prompt,system)},
+    {name:"Groq",     key:GROQ_KEY,      fn:()=>callGroq(prompt,system)},
+    {name:"DeepSeek", key:DEEPSEEK_KEY,  fn:()=>callDeepSeek(prompt,system)},
+  ];
+
+  for (const {name,key,fn} of chain) {
+    if (!key) continue;
+    try {
+      console.log(`📖 English comprehension gen via ${name} (${count} Qs)`);
+      const text = await fn();
+      const clean = text.replace(/```json|```/g,"").trim();
+      const start = clean.indexOf("["), end = clean.lastIndexOf("]");
+      if (start === -1 || end === -1) throw new Error("No JSON array");
+      const parsed = JSON.parse(clean.slice(start, end+1));
+      if (Array.isArray(parsed) && parsed.length > 0) {
+        console.log(`✅ ${name} generated ${parsed.length} English questions with passages`);
+        return parsed.slice(0, count).map(q => ({...q, source:"AI", aiModel:name}));
+      }
+    } catch(e) { console.error(`❌ ${name} English gen:`, e.message); }
+  }
+  return [];
+};
+
 const generateQuestionsAI = async (subject, examType, year, count) => {
   const system = `You are a professional Nigerian ${examType?.toUpperCase()||"WAEC"} examiner. Generate authentic past-question style MCQs. ${NG_CONTEXT}`;
   const prompt = buildQGenPrompt(subject, examType, year, count);
@@ -450,16 +519,78 @@ const generateQuestionsAI = async (subject, examType, year, count) => {
 // ═══════════════════════════════════════════════════════════════════════════════
 // HYBRID QUESTION FETCHER
 // Strategy:
-//   1. Try ALOC first → real past questions
-//   2. If ALOC returns < requested count → fill gap with AI-generated questions
-//   3. Shuffle and label each question with its source ("ALOC" or "AI")
+//   ENGLISH (special case):
+//     - 40% from ALOC → standalone lexis, vocabulary, oral English (no passage needed)
+//     - 60% from AI   → comprehension passages + linked questions, summary
+//     - Do NOT shuffle — keep comprehension groups together
+//
+//   ALL OTHER SUBJECTS:
+//     1. Try ALOC first → real past questions
+//     2. Fill gap with AI if ALOC returns fewer than requested
+//     3. Shuffle combined results
 // ═══════════════════════════════════════════════════════════════════════════════
 const fetchHybridQuestions = async (subject, examType, year, count) => {
-  let alocQuestions  = [];
-  let aiQuestions    = [];
-  let alocError      = null;
+  let alocQuestions = [];
+  let aiQuestions   = [];
+  let alocError     = null;
 
-  // ── Step 1: Try ALOC ────────────────────────────────────────────────────────
+  // ── ENGLISH: special hybrid split ──────────────────────────────────────────
+  if (isEnglish(subject)) {
+    const alocTarget = Math.floor(count * 0.4);   // 40% standalone from ALOC
+    const aiTarget   = count - alocTarget;         // 60% comprehension from AI
+
+    console.log(`📖 English hybrid: ${alocTarget} ALOC standalone + ${aiTarget} AI comprehension`);
+
+    // Fetch standalone English from ALOC (lexis, vocab, oral)
+    try {
+      alocQuestions = await fetchALOCBatch(subject, examType, year, alocTarget);
+      // Filter out comprehension questions from ALOC (they lack passages)
+      // Keep only clearly standalone: short questions without "passage" indicators
+      alocQuestions = alocQuestions.filter(q => {
+        const text = q.q.toLowerCase();
+        const looksLikeComprehension =
+          text.includes("according to") ||
+          text.includes("the passage") ||
+          text.includes("the writer") ||
+          text.includes("the author") ||
+          text.includes("the extract") ||
+          text.includes("paragraph");
+        return !looksLikeComprehension;
+      });
+      console.log(`✅ ALOC English: ${alocQuestions.length} standalone questions`);
+    } catch(e) {
+      alocError = e.message;
+      console.warn(`⚠️  ALOC English failed: ${e.message}`);
+    }
+
+    // Generate comprehension + other sections with AI
+    try {
+      const comprehensionQs = await generateEnglishComprehension(examType, year, aiTarget);
+      aiQuestions = comprehensionQs;
+      console.log(`✅ AI generated ${aiQuestions.length} English questions with passages`);
+    } catch(e) {
+      console.error("❌ English comprehension AI gen failed:", e.message);
+    }
+
+    // For English: put comprehension questions FIRST (grouped), then standalone
+    // This mirrors real JAMB/WAEC paper structure
+    const ordered = [...aiQuestions, ...alocQuestions];
+
+    if (!ordered.length) {
+      throw new Error("No English questions available from any source");
+    }
+
+    return {
+      questions: ordered.slice(0, count),
+      alocCount: alocQuestions.length,
+      aiCount:   aiQuestions.length,
+      total:     ordered.length,
+      alocError,
+      englishMode: true,
+    };
+  }
+
+  // ── ALL OTHER SUBJECTS: standard ALOC → AI fallback ────────────────────────
   try {
     console.log(`📚 ALOC: Fetching ${count} questions for ${subject} (${examType} ${year||"any"})`);
     alocQuestions = await fetchALOCBatch(subject, examType, year, count);
@@ -469,7 +600,6 @@ const fetchHybridQuestions = async (subject, examType, year, count) => {
     console.warn(`⚠️  ALOC failed: ${e.message}`);
   }
 
-  // ── Step 2: Fill gap with AI if needed ─────────────────────────────────────
   const gap = count - alocQuestions.length;
   if (gap > 0) {
     console.log(`🤖 Gap: ${gap} questions missing → generating with AI`);
@@ -483,22 +613,21 @@ const fetchHybridQuestions = async (subject, examType, year, count) => {
   }
 
   const combined = [...alocQuestions, ...aiQuestions];
-
   if (!combined.length) {
     throw new Error(`No questions available for ${subject} ${examType} ${year||""}`);
   }
 
-  // Shuffle combined array
+  // Shuffle non-English subjects
   for (let i = combined.length-1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i+1));
     [combined[i], combined[j]] = [combined[j], combined[i]];
   }
 
   return {
-    questions:    combined.slice(0, count),
-    alocCount:    alocQuestions.length,
-    aiCount:      aiQuestions.length,
-    total:        combined.length,
+    questions: combined.slice(0, count),
+    alocCount: alocQuestions.length,
+    aiCount:   aiQuestions.length,
+    total:     combined.length,
     alocError,
   };
 };
