@@ -116,44 +116,114 @@ const fetchALOC = async (subject, examType, year, count = 20) => {
 
   const data = await res.json();
 
-  // ALOC returns either { data: [...] } or an array directly
-  const raw = Array.isArray(data) ? data : (data.data || []);
+  // ALOC response can be wrapped in several ways depending on version:
+  //   { data: [...] }  — most common
+  //   { body: [...] }  — some endpoints
+  //   [...]            — direct array
+  //   { status, data: { data: [...] } }  — nested
+  let raw = [];
+  if (Array.isArray(data)) {
+    raw = data;
+  } else if (Array.isArray(data.data)) {
+    raw = data.data;
+  } else if (Array.isArray(data.body)) {
+    raw = data.body;
+  } else if (data.data && Array.isArray(data.data.data)) {
+    raw = data.data.data;
+  } else {
+    // Log the actual shape so we can debug
+    console.warn("ALOC unexpected response shape:", JSON.stringify(data).slice(0, 300));
+    raw = [];
+  }
+
   if (!raw.length) throw new Error("ALOC returned 0 questions");
 
-  // Normalise to ExamAce internal format
-  return raw.map(q => normaliseALOC(q, examType, subject));
+  // Normalise and filter out any questions with missing data
+  const normalised = raw
+    .map(q => normaliseALOC(q, examType, subject))
+    .filter(q => q !== null);   // normaliseALOC returns null for bad questions
+
+  console.log(`📚 ALOC: ${raw.length} raw → ${normalised.length} valid questions`);
+
+  if (!normalised.length) throw new Error("ALOC returned questions but all had empty options — check API response format");
+
+  return normalised;
 };
 
 /**
- * Normalise an ALOC question to our standard format
- * ALOC format: { id, question, option_a, option_b, option_c, option_d, answer, solution, year, examtype }
+ * Normalise an ALOC question to our standard format.
+ *
+ * ALOC actual API response shape (from live inspection):
+ * {
+ *   id, question,
+ *   a, b, c, d,           ← option fields are SINGLE LETTERS not "option_a"
+ *   answer: "A"|"B"|"C"|"D"  OR full answer text,
+ *   solution, year, examtype, subject
+ * }
+ *
+ * Some older ALOC responses still use option_a/b/c/d — we handle both.
  */
 const normaliseALOC = (q, examType, subject) => {
-  // ALOC answer is "A"|"B"|"C"|"D" or the actual option text — normalise to letter
-  let answer = (q.answer || "A").toString().toUpperCase().trim();
-  // Sometimes ALOC returns the full text of the answer — detect and convert
+  // ── Extract option text — handle both field naming conventions ─────────────
+  // New ALOC format: q.a, q.b, q.c, q.d
+  // Old ALOC format: q.option_a, q.option_b, q.option_c, q.option_d
+  const optA = String(q.a || q.option_a || q.optionA || q.OptionA || "").trim();
+  const optB = String(q.b || q.option_b || q.optionB || q.OptionB || "").trim();
+  const optC = String(q.c || q.option_c || q.optionC || q.OptionC || "").trim();
+  const optD = String(q.d || q.option_d || q.optionD || q.OptionD || "").trim();
+
+  // ── Extract question text ──────────────────────────────────────────────────
+  const questionText = String(q.question || q.q || q.body || "").trim();
+
+  // ── Normalise answer to letter A/B/C/D ────────────────────────────────────
+  let answer = String(q.answer || q.correct || q.correct_answer || "A").trim();
+
+  // If answer is longer than 1 char, it might be the full option text
   if (answer.length > 1) {
-    const opts = { A: q.option_a, B: q.option_b, C: q.option_c, D: q.option_d };
-    const match = Object.entries(opts).find(([, v]) => v && v.trim() === answer.trim());
-    answer = match ? match[0] : "A";
+    // Try case-insensitive match against option texts
+    const opts = [["A", optA], ["B", optB], ["C", optC], ["D", optD]];
+    const match = opts.find(([, v]) => v && v.toLowerCase() === answer.toLowerCase());
+    if (match) {
+      answer = match[0];
+    } else {
+      // Try first-letter match: "A. Some text" → "A"
+      const firstLetter = answer.charAt(0).toUpperCase();
+      if (["A","B","C","D"].includes(firstLetter)) {
+        answer = firstLetter;
+      } else {
+        // Last resort: default to A and log warning
+        console.warn(`ALOC: could not determine answer letter for question ${q.id}, raw answer: "${answer}"`);
+        answer = "A";
+      }
+    }
+  } else {
+    answer = answer.toUpperCase();
+    if (!["A","B","C","D"].includes(answer)) answer = "A";
+  }
+
+  // ── Skip questions with empty options (data quality issue) ─────────────────
+  const hasOptions = optA || optB || optC || optD;
+  if (!hasOptions || !questionText) {
+    console.warn(`ALOC: skipping question ${q.id} — missing question text or options`);
+    return null;  // caller must filter out nulls
   }
 
   return {
     id:          q.id,
-    q:           (q.question || "").trim(),
+    q:           questionText,
     options: {
-      A: (q.option_a || "").trim(),
-      B: (q.option_b || "").trim(),
-      C: (q.option_c || "").trim(),
-      D: (q.option_d || "").trim(),
+      A: optA,
+      B: optB,
+      C: optC,
+      D: optD,
     },
     answer,
-    explanation: (q.solution || q.explanation || "See official marking scheme.").trim(),
-    topic:       q.topic || subject || "",
+    explanation: String(q.solution || q.explanation || q.solutionNote || "See official marking scheme.").trim(),
+    topic:       String(q.topic || q.section || subject || "").trim(),
     year:        q.year   || "Past",
     difficulty:  q.difficulty || "medium",
-    source:      "ALOC",           // ← mark as real past question
-    examType:    q.examtype || examType,
+    source:      "ALOC",
+    examType:    q.examtype || q.exam_type || examType,
   };
 };
 
@@ -592,6 +662,39 @@ app.get("/test-aloc", async (req, res) => {
     res.json({ status:"✅ ALOC connected", sample: qs.slice(0,2), count: qs.length });
   } catch(e) {
     res.status(500).json({ status:"❌ ALOC failed", error: e.message });
+  }
+});
+
+// ── DEBUG: See raw ALOC response (use this to diagnose field name issues) ─────
+// Visit: /debug-aloc?subject=english&type=utme
+app.get("/debug-aloc", async (req, res) => {
+  const subject = req.query.subject || "mathematics";
+  const type    = req.query.type    || "utme";
+  const alocSubject = ALOC_SUBJECT_MAP[subject.toLowerCase()] || subject;
+  const alocType    = ALOC_TYPE_MAP[type.toLowerCase()]       || type;
+
+  try {
+    const url = `${ALOC_BASE}/q/3?subject=${alocSubject}&type=${alocType}`;
+    console.log("Debug ALOC fetch:", url);
+    const r = await fetch(url, { headers: alocHeaders() });
+    const raw = await r.json();
+
+    // Show first question's keys so we know the field names
+    let firstQ = null;
+    if (Array.isArray(raw) && raw.length)          firstQ = raw[0];
+    else if (Array.isArray(raw?.data) && raw.data.length) firstQ = raw.data[0];
+    else if (Array.isArray(raw?.body) && raw.body.length) firstQ = raw.body[0];
+
+    res.json({
+      status: "✅ Raw ALOC response",
+      url,
+      responseType: Array.isArray(raw) ? "direct array" : `object with keys: ${Object.keys(raw||{}).join(", ")}`,
+      firstQuestionKeys: firstQ ? Object.keys(firstQ) : "no questions found",
+      firstQuestion: firstQ,
+      rawSample: raw,
+    });
+  } catch(e) {
+    res.status(500).json({ status:"❌ Debug failed", error: e.message });
   }
 });
 
