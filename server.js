@@ -8,6 +8,42 @@ const jwt     = require("jsonwebtoken");
 const app = express();
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// SECURITY HARDENING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Security headers
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options',    'nosniff');
+  res.setHeader('X-Frame-Options',           'DENY');
+  res.setHeader('X-XSS-Protection',          '1; mode=block');
+  res.setHeader('Referrer-Policy',           'strict-origin-when-cross-origin');
+  res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  next();
+});
+
+// In-memory rate limiter — no extra package needed
+const _rls = new Map();
+const _cleanup = setInterval(() => { const c=Date.now()-600000; for(const [k,v] of _rls) if(v.start<c) _rls.delete(k); }, 600000);
+const rateLimit = (max, windowMs) => (req, res, next) => {
+  const key = req.ip || 'unknown';
+  const now = Date.now();
+  const d   = _rls.get(key) || {count:0,start:now};
+  if (now - d.start > windowMs) { d.count=0; d.start=now; }
+  d.count++;
+  _rls.set(key, d);
+  if (d.count > max) return res.status(429).json({error:'Too many requests. Please slow down and try again.'});
+  next();
+};
+
+// Input sanitization
+const sanitize = (str, max=500) => {
+  if (typeof str !== 'string') return '';
+  return str.trim().slice(0,max).replace(/<[^>]*>/g,'');
+};
+const isValidEmail = (e) => typeof e==='string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e) && e.length<=254;
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // USER PROFILE & GAMIFICATION — JSON file store + JWT auth
 // ═══════════════════════════════════════════════════════════════════════════════
 const JWT_SECRET = process.env.JWT_SECRET || "examace-secret-change-in-prod";
@@ -126,7 +162,7 @@ const ALLOWED_ORIGINS = [
   "http://localhost:5173",
   "http://localhost:5174",
   // Add your actual frontend Render URL below:
-  "https://examace-ai.onrender.com",   // ← change this to your frontend URL
+  "https://examace-frontend.onrender.com",   // ← change this to your frontend URL
   // If you have a custom domain, add it too:
   // "https://www.examace.ng",
 ];
@@ -520,64 +556,214 @@ const callClaude = async (messages, system, imgData) => {
 };
 
 // Quality check
-const isAnswerSufficient = (text) => {
-  if (!text || text.trim().length < 150) return false;
-  const l = text.toLowerCase();
-  return !l.includes("i'm not sure") && !l.includes("i cannot") && !l.includes("i don't know") && !l.includes("i am unable");
+// ═══════════════════════════════════════════════════════════════════════════════
+// SMART AI QUALITY SCORING & ROUTING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Quality indicators — educational Nigerian exam context
+const QUALITY_INDICATORS = {
+  positive: [
+    /step\s*\d+/i, /\*\*[^*]+\*\*/,        // structured steps, bold terms
+    /example/i, /formula/i, /note:/i,        // educational markers
+    /waec|neco|jamb/i,                        // exam context awareness
+    /therefore|hence|because|since/i,         // reasoning words
+    /₦|naira/i, /nigeria/i,                   // Nigerian context
+    /\d+\s*%|\d+\/\d+/,                       // numbers/fractions in answers
+  ],
+  negative: [
+    /i'm not sure/i, /i cannot/i, /i don't know/i, /i am unable/i,
+    /as an ai/i, /i apologize/i, /unfortunately/i,
+    /i cannot provide/i, /i'm unable to/i,
+  ],
 };
 
-// Clarification triggers
+const scoreAnswer = (text) => {
+  if (!text || text.trim().length < 100) return 0;
+  let score = Math.min(text.length / 10, 200); // length score, capped at 200
+
+  // Quality bonuses
+  for (const rx of QUALITY_INDICATORS.positive) {
+    if (rx.test(text)) score += 20;
+  }
+  // Quality penalties
+  for (const rx of QUALITY_INDICATORS.negative) {
+    if (rx.test(text)) score -= 80;
+  }
+  // Structural bonuses
+  if (text.includes("
+"))       score += 15;  // has line breaks = structured
+  if (text.split("
+").length>4) score += 20;  // multi-paragraph
+  if (/\d/.test(text))           score += 10;  // contains numbers
+
+  return Math.max(score, 0);
+};
+
+const isAnswerSufficient = (text) => {
+  if (!text || text.trim().length < 150) return false;
+  return scoreAnswer(text) >= 80; // must clear quality threshold
+};
+
+// Clarification triggers → always go to Claude for best plain-English explanation
 const CLARIFICATION_TRIGGERS = [
   "i don't understand","i dont understand","not clear","confusing","confused",
   "explain better","explain again","can you clarify","clarify","what do you mean",
   "please explain","still don't get","still dont get","make it simpler",
   "simpler explanation","break it down","can you simplify","rephrase",
   "i'm lost","im lost","not getting it","elaborate","more detail",
+  "show me how","how do i","walk me through","demonstrate",
 ];
 const needsClarification = (text) => {
   const l = (text || "").toLowerCase();
   return CLARIFICATION_TRIGGERS.some(t => l.includes(t));
 };
 
+// "Show me how" trigger → Claude gives step-by-step visual explanation
+const SHOW_ME_TRIGGERS = [
+  "show me how", "show me", "demonstrate", "walk me through",
+  "step by step", "how do i solve", "how to solve", "work it out",
+  "full working", "full solution", "solve for me",
+];
+const needsShowMe = (text) => {
+  const l = (text || "").toLowerCase();
+  return SHOW_ME_TRIGGERS.some(t => l.includes(t));
+};
+
 const STEM_SUBJECTS = ["mathematics","further mathematics","math","maths","physics","chemistry","biology","agricultural science","statistics","calculus"];
 const isSTEM = (text) => { const l=(text||"").toLowerCase(); return STEM_SUBJECTS.some(s=>l.includes(s)); };
 
-// 4-tier AI chat router (for /api/chat — general questions, not question generation)
+// ── SMART 4-TIER ROUTER ───────────────────────────────────────────────────────
+// Strategy:
+//   Images        → Gemini (vision) → Claude (vision fallback)
+//   "Show me how" → Claude directly (best step-by-step visual explainer)
+//   Clarification → Claude directly (best plain-language explainer)
+//   STEM          → Gemini & DeepSeek race → best quality wins → Groq → Claude
+//   General       → Gemini first → Groq → DeepSeek → Claude
+//   Claude is LAST RESORT except for show-me/clarification requests
 const smartAnswer = async (messages, system, imgData) => {
   const lastMsg = getLastMsg(messages);
   const context = `${system||""} ${lastMsg}`;
-  const clarification = needsClarification(lastMsg);
-  const stem = isSTEM(context);
+  const stem    = isSTEM(context);
+  const showMe  = needsShowMe(lastMsg);
+  const clarify = needsClarification(lastMsg);
 
+  // ── Images: Gemini → Claude ───────────────────────────────────────────────
   if (imgData) {
     let ans = "";
-    try { ans = await callGemini(messages, system, imgData); if(isAnswerSufficient(ans)) return {answer:ans,source:"Gemini"}; } catch(e){console.error("Gemini img:",e.message);}
+    try {
+      ans = await callGemini(messages, system, imgData);
+      if (isAnswerSufficient(ans)) return { answer:ans, source:"Gemini" };
+    } catch(e) { console.error("Gemini img:", e.message); }
     if (ANTHROPIC_KEY) {
-      try { ans = await callClaude(messages, system, imgData); if(ans) return {answer:ans,source:"Claude"}; } catch(e){console.error("Claude img:",e.message);}
+      try {
+        ans = await callClaude(messages, system, imgData);
+        if (ans) return { answer:ans, source:"Claude" };
+      } catch(e) { console.error("Claude img:", e.message); }
     }
     return { answer: ans || "⚠️ Could not read image. Please try again.", source:"Error" };
   }
 
-  if (clarification && ANTHROPIC_KEY) {
-    try { const a = await callClaude(messages, system); if(a) return {answer:a,source:"Claude"}; } catch(e){console.error("Claude clarify:",e.message);}
+  // ── "Show me how" → Claude with rich step-by-step prompt ─────────────────
+  if (showMe && ANTHROPIC_KEY) {
+    console.log("🎓 Show-me request → Claude step-by-step");
+    const showMeSystem = (system||"") + `
+
+IMPORTANT: The student wants a STEP-BY-STEP visual explanation. 
+Format your answer with:
+**Step 1:** [action] → [result]
+**Step 2:** [action] → [result]
+[continue for all steps]
+**✅ Final Answer:** [answer with units]
+**📌 Key Formula:** [formula used]
+**💡 Memory Tip:** [how to remember this for WAEC/JAMB]
+Use bold, clear numbered steps. Show ALL working. Nigerian exam context throughout.`;
+    try {
+      const a = await callClaude(messages, showMeSystem);
+      if (a) return { answer:a, source:"Claude" };
+    } catch(e) { console.error("Claude show-me:", e.message); }
+    // Fall through to normal chain if Claude fails
   }
 
-  const chain = stem
-    ? [{name:"Gemini",key:GEMINI_KEY,fn:()=>callGemini(messages,system)},{name:"DeepSeek",key:DEEPSEEK_KEY,fn:()=>callDeepSeek(messages,system)},{name:"Groq",key:GROQ_KEY,fn:()=>callGroq(messages,system)},{name:"Claude",key:ANTHROPIC_KEY,fn:()=>callClaude(messages,system)}]
-    : [{name:"Gemini",key:GEMINI_KEY,fn:()=>callGemini(messages,system)},{name:"Groq",key:GROQ_KEY,fn:()=>callGroq(messages,system)},{name:"DeepSeek",key:DEEPSEEK_KEY,fn:()=>callDeepSeek(messages,system)},{name:"Claude",key:ANTHROPIC_KEY,fn:()=>callClaude(messages,system)}];
-
-  let lastAnswer = "";
-  for (const {name,key,fn} of chain) {
-    if (!key) { console.log(`⏭️  Skip ${name} — no key`); continue; }
+  // ── Clarification → Claude ────────────────────────────────────────────────
+  if (clarify && ANTHROPIC_KEY) {
+    console.log("🔄 Clarification → Claude");
     try {
-      console.log(`🤖 Trying ${name}...`);
+      const a = await callClaude(messages, system);
+      if (a) return { answer:a, source:"Claude" };
+    } catch(e) { console.error("Claude clarify:", e.message); }
+  }
+
+  // ── STEM: Race Gemini + DeepSeek in parallel, pick best quality ───────────
+  if (stem && GEMINI_KEY && DEEPSEEK_KEY) {
+    console.log("🔬 STEM: Racing Gemini vs DeepSeek for quality...");
+    const [gResult, dResult] = await Promise.allSettled([
+      GEMINI_KEY   ? callGemini(messages, system)   : Promise.reject("no key"),
+      DEEPSEEK_KEY ? callDeepSeek(messages, system) : Promise.reject("no key"),
+    ]);
+    const gAns = gResult.status === "fulfilled" ? gResult.value : "";
+    const dAns = dResult.status === "fulfilled" ? dResult.value : "";
+    const gScore = scoreAnswer(gAns);
+    const dScore = scoreAnswer(dAns);
+    console.log(`📊 Gemini: ${gScore} pts | DeepSeek: ${dScore} pts`);
+
+    const best = gScore >= dScore ? { answer:gAns, score:gScore, source:"Gemini" }
+                                  : { answer:dAns, score:dScore, source:"DeepSeek" };
+
+    if (best.score >= 80) {
+      console.log(`✅ Best STEM answer: ${best.source} (${best.score} pts)`);
+      return { answer:best.answer, source:best.source };
+    }
+    // Neither was good enough — fall through to sequential chain
+    console.log("⚠️  Both STEM parallel answers weak — trying sequential chain");
+  }
+
+  // ── Sequential fallback chain ─────────────────────────────────────────────
+  // STEM: Gemini → DeepSeek → Groq → Claude
+  // General: Gemini → Groq → DeepSeek → Claude
+  const chain = stem
+    ? [
+        {name:"Gemini",   key:GEMINI_KEY,    fn:()=>callGemini(messages,system)},
+        {name:"DeepSeek", key:DEEPSEEK_KEY,  fn:()=>callDeepSeek(messages,system)},
+        {name:"Groq",     key:GROQ_KEY,      fn:()=>callGroq(messages,system)},
+        {name:"Claude",   key:ANTHROPIC_KEY, fn:()=>callClaude(messages,system)},
+      ]
+    : [
+        {name:"Gemini",   key:GEMINI_KEY,    fn:()=>callGemini(messages,system)},
+        {name:"Groq",     key:GROQ_KEY,      fn:()=>callGroq(messages,system)},
+        {name:"DeepSeek", key:DEEPSEEK_KEY,  fn:()=>callDeepSeek(messages,system)},
+        {name:"Claude",   key:ANTHROPIC_KEY, fn:()=>callClaude(messages,system)},
+      ];
+
+  let bestAnswer = "";
+  let bestScore  = 0;
+  let bestSource = "";
+
+  for (const {name,key,fn} of chain) {
+    if (!key) continue;
+    try {
+      console.log(`🤖 ${name}...`);
       const a = await fn();
-      if (isAnswerSufficient(a)) { console.log(`✅ ${name} (${a.length} chars)`); return {answer:a,source:name}; }
-      console.log(`⚠️  ${name} weak (${a?.length||0} chars)`);
-      lastAnswer = a || lastAnswer;
+      const s = scoreAnswer(a);
+      console.log(`   Score: ${s} pts (${a?.length||0} chars)`);
+
+      // Accept immediately if clearly good
+      if (s >= 120) {
+        console.log(`✅ ${name} accepted (${s} pts)`);
+        return { answer:a, source:name };
+      }
+      // Keep as best so far if better than previous
+      if (s > bestScore) { bestAnswer=a; bestScore=s; bestSource=name; }
+
     } catch(e) { console.error(`❌ ${name}:`, e.message); }
   }
-  return { answer: lastAnswer || "⚠️ Service temporarily unavailable. Please try again.", source:"Error" };
+
+  // Return best answer found, even if below ideal threshold
+  if (bestAnswer) {
+    console.log(`📤 Best available: ${bestSource} (${bestScore} pts)`);
+    return { answer:bestAnswer, source:bestSource };
+  }
+
+  return { answer:"⚠️ Service temporarily unavailable. Please try again.", source:"Error" };
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -822,7 +1008,7 @@ const fetchHybridQuestions = async (subject, examType, year, count) => {
 // ── GET QUESTIONS (hybrid ALOC + AI) ─────────────────────────────────────────
 // Used by frontend Quiz and JAMB CBT components
 // Query params: subject, exam (waec|jamb|neco), year, count
-app.get("/api/questions", async (req, res) => {
+app.get("/api/questions", rateLimit(30, 60*1000), async (req, res) => {
   const { subject, exam, year, count } = req.query;
 
   if (!subject) return res.status(400).json({ error: "subject is required" });
@@ -891,7 +1077,7 @@ app.post("/api/questions/batch", async (req, res) => {
 });
 
 // ── CHAT ENDPOINT (4-tier AI router for explanations/conversations) ───────────
-app.post("/api/chat", async (req, res) => {
+app.post("/api/chat", rateLimit(60, 60*1000), async (req, res) => {
   console.log("📨 Chat:", JSON.stringify(req.body).slice(0,120));
   const { messages, system, imgData } = req.body;
   try {
@@ -943,7 +1129,7 @@ Always end with a relevant exam tip or next action.`;
 
 // ── STREAMING CHAT ENDPOINT (token-by-token via SSE) ─────────────────────────
 // Frontend connects with EventSource, answers stream word-by-word
-app.post("/api/chat/stream", async (req, res) => {
+app.post("/api/chat/stream", rateLimit(30, 60*1000), async (req, res) => {
   const { messages, system, imgData } = req.body;
 
   res.setHeader("Content-Type",  "text/event-stream");
@@ -1074,9 +1260,17 @@ app.get("/", (req, res) => {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // ── REGISTER ─────────────────────────────────────────────────────────────────
-app.post("/api/auth/register", async (req, res) => {
-  const { name, email, password, exam, subjects=[], state="" } = req.body;
+app.post("/api/auth/register", rateLimit(5, 15*60*1000), async (req, res) => {
+  const rawName  = sanitize(req.body.name,    100);
+  const rawEmail = sanitize(req.body.email,   254).toLowerCase();
+  const password = typeof req.body.password === "string" ? req.body.password.slice(0,128) : "";
+  const exam     = sanitize(req.body.exam,     20) || "WAEC";
+  const state    = sanitize(req.body.state,    60);
+  const subjects = Array.isArray(req.body.subjects) ? req.body.subjects.map(s=>sanitize(s,60)).slice(0,12) : [];
+
+  const name = rawName, email = rawEmail;
   if(!name||!email||!password) return res.status(400).json({error:"Name, email and password required"});
+  if(!isValidEmail(email))     return res.status(400).json({error:"Invalid email address"});
   if(password.length < 6)      return res.status(400).json({error:"Password must be at least 6 characters"});
 
   const db = readDB();
@@ -1113,9 +1307,11 @@ app.post("/api/auth/register", async (req, res) => {
 });
 
 // ── LOGIN ─────────────────────────────────────────────────────────────────────
-app.post("/api/auth/login", async (req, res) => {
-  const { email, password } = req.body;
+app.post("/api/auth/login", rateLimit(10, 15*60*1000), async (req, res) => {
+  const email    = sanitize(req.body.email, 254).toLowerCase();
+  const password = typeof req.body.password === "string" ? req.body.password.slice(0,128) : "";
   if(!email||!password) return res.status(400).json({error:"Email and password required"});
+  if(!isValidEmail(email)) return res.status(400).json({error:"Invalid email address"});
 
   const db = readDB();
   const profile = db.users[email.toLowerCase()];
