@@ -59,7 +59,7 @@ const XP_RULES = {
 };
 
 const LEVELS = [
-  {level:1, name:"JSS3 Student",    minXP:0,    badge:"🌱", color:"#22c55e"},
+  {level:1, name:"SS1 Starter",     minXP:0,    badge:"🌱", color:"#22c55e"},
   {level:2, name:"SS1 Learner",     minXP:100,  badge:"📚", color:"#38bdf8"},
   {level:3, name:"SS2 Scholar",     minXP:300,  badge:"⭐", color:"#a855f7"},
   {level:4, name:"SS3 Candidate",   minXP:600,  badge:"🎯", color:"#f97316"},
@@ -536,23 +536,147 @@ const callGroq = async (messages, system) => {
   return d.choices?.[0]?.message?.content || "";
 };
 
-// Claude
+// ═══════════════════════════════════════════════════════════════════════════════
+// CLAUDE CIRCUIT BREAKER — prevents app downtime when credits/quota run out
+// App continues serving students on Gemini + DeepSeek + Groq when Claude is down
+// ═══════════════════════════════════════════════════════════════════════════════
+const claudeState = {
+  disabled:       false,
+  disabledAt:     null,
+  disabledReason: "",
+  reCheckMs:      6 * 60 * 60 * 1000,  // re-check after 6 hours by default
+  failCount:      0,
+  callsToday:     0,
+  errorsToday:    0,
+  lastReset:      new Date().toDateString(),
+  lastError:      "",
+  MAX_DAILY:      parseInt(process.env.CLAUDE_DAILY_LIMIT || "300"),
+};
+
+// Daily reset at midnight + auto re-enable if credits may have been topped up
+setInterval(() => {
+  const today = new Date().toDateString();
+  if (claudeState.lastReset !== today) {
+    claudeState.callsToday  = 0;
+    claudeState.errorsToday = 0;
+    claudeState.failCount   = 0;
+    claudeState.lastReset   = today;
+    // Re-enable at midnight — assume credits may have been topped up
+    if (claudeState.disabled && claudeState.disabledReason === "credits_exhausted") {
+      claudeState.disabled       = false;
+      claudeState.disabledReason = "";
+      console.log("🌅 Midnight — Claude re-enabled. App will retry on next request.");
+    }
+  }
+  // Also retry after reCheckMs even during the day
+  if (claudeState.disabled && claudeState.disabledAt &&
+      Date.now() - claudeState.disabledAt > claudeState.reCheckMs) {
+    console.log("🔄 Claude circuit breaker: auto-retrying after cooldown...");
+    claudeState.disabled  = false;
+    claudeState.failCount = 0;
+  }
+}, 60 * 1000); // check every minute
+
+const isClaudeAvailable = () => {
+  if (!ANTHROPIC_KEY)       return false;
+  if (claudeState.disabled) return false;
+  if (claudeState.callsToday >= claudeState.MAX_DAILY) {
+    if (!claudeState.disabled) {
+      claudeState.disabled       = true;
+      claudeState.disabledAt     = Date.now();
+      claudeState.disabledReason = "daily_limit_reached";
+      claudeState.reCheckMs      = 24 * 60 * 60 * 1000;
+      console.warn(`⚠️  Claude daily limit (${claudeState.MAX_DAILY}) reached — using Gemini/DeepSeek/Groq for rest of day`);
+    }
+    return false;
+  }
+  return true;
+};
+
 const callClaude = async (messages, system, imgData) => {
+  if (!isClaudeAvailable()) throw new Error("Claude: temporarily disabled (credit exhaustion)");
+
   let msgs = messages;
   if (imgData) {
-    msgs = [{ role:"user", content:[{type:"image",source:{type:"base64",media_type:imgData.type,data:imgData.data}},{type:"text",text:getLastMsg(messages)}] }];
+    msgs = [{ role:"user", content:[
+      {type:"image", source:{type:"base64", media_type:imgData.type, data:imgData.data}},
+      {type:"text",  text:getLastMsg(messages)}
+    ]}];
   } else if (typeof messages === "string") {
     msgs = [{ role:"user", content:messages }];
   }
+
   const body = { model:"claude-sonnet-4-20250514", max_tokens:1500, messages:msgs };
   if (system) body.system = system;
+
   const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method:"POST", headers:{"Content-Type":"application/json","x-api-key":ANTHROPIC_KEY,"anthropic-version":"2023-06-01"},
-    body:JSON.stringify(body)
+    method: "POST",
+    headers: {
+      "Content-Type":      "application/json",
+      "x-api-key":         ANTHROPIC_KEY,
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify(body),
   });
+
   const d = await res.json();
-  if (d.error) throw new Error(`Claude: ${d.error.message}`);
-  return d.content?.find(b => b.type==="text")?.text || "";
+
+  // Detect credit exhaustion and other billing errors
+  if (d.error) {
+    const msg = d.error.message || "";
+    const type = d.error.type   || "";
+
+    // Credit/billing errors — disable Claude until top-up
+    const isCreditError = (
+      type === "credit_limit_error" ||
+      type === "billing_error"      ||
+      res.status === 402            ||
+      msg.toLowerCase().includes("credit")  ||
+      msg.toLowerCase().includes("billing") ||
+      msg.toLowerCase().includes("quota")   ||
+      msg.toLowerCase().includes("insufficient")
+    );
+
+    if (isCreditError) {
+      claudeState.disabled  = true;
+      claudeState.disabledAt = Date.now();
+      claudeState.lastError  = `Credits exhausted at ${new Date().toISOString()}`;
+      claudeState.failCount++;
+      console.error("⚠️  Claude credits exhausted — disabling Claude for 6 hours. App continues on Gemini/DeepSeek/Groq.");
+      throw new Error("Claude: credits exhausted — falling back to other AI");
+    }
+
+    // Rate limit — back off briefly but don't disable permanently
+    if (res.status === 429) {
+      claudeState.failCount++;
+      if (claudeState.failCount >= 3) {
+        claudeState.disabled   = true;
+        claudeState.disabledAt = Date.now();
+        claudeState.reCheckMs  = 15 * 60 * 1000; // retry sooner for rate limits (15min)
+        claudeState.lastError  = "Rate limited";
+        console.warn("⚠️  Claude rate limited 3x — disabling for 15 minutes.");
+      }
+      throw new Error("Claude: rate limited");
+    }
+
+    // Other errors — count failures, disable after 5 consecutive
+    claudeState.failCount++;
+    claudeState.lastError = msg;
+    if (claudeState.failCount >= 5) {
+      claudeState.disabled   = true;
+      claudeState.disabledAt = Date.now();
+      claudeState.reCheckMs  = 30 * 60 * 1000; // retry in 30min
+      console.warn(`⚠️  Claude failed ${claudeState.failCount}x — disabling for 30 minutes.`);
+    }
+    throw new Error(`Claude: ${msg}`);
+  }
+
+  // Success — reset failure count, increment daily usage
+  claudeState.failCount  = 0;
+  claudeState.disabled   = false;
+  claudeState.callsToday = (claudeState.callsToday || 0) + 1;
+  console.log(`✅ Claude success (${claudeState.callsToday}/${claudeState.MAX_DAILY} today)`);
+  return d.content?.find(b => b.type === "text")?.text || "";
 };
 
 // Quality check
@@ -650,19 +774,19 @@ const smartAnswer = async (messages, system, imgData) => {
     let ans = "";
     try {
       ans = await callGemini(messages, system, imgData);
-      if (isAnswerSufficient(ans)) return { answer:ans, source:"Gemini" };
+      if (isAnswerSufficient(ans)) return { answer:ans, source:"ExamAce AI" };
     } catch(e) { console.error("Gemini img:", e.message); }
-    if (ANTHROPIC_KEY) {
+    if (isClaudeAvailable()) {
       try {
         ans = await callClaude(messages, system, imgData);
-        if (ans) return { answer:ans, source:"Claude" };
+        if (ans) return { answer:ans, source:"ExamAce AI" };
       } catch(e) { console.error("Claude img:", e.message); }
     }
     return { answer: ans || "⚠️ Could not read image. Please try again.", source:"Error" };
   }
 
   // ── "Show me how" → Claude with rich step-by-step prompt ─────────────────
-  if (showMe && ANTHROPIC_KEY) {
+  if (showMe && isClaudeAvailable()) {
     console.log("🎓 Show-me request → Claude step-by-step");
     const showMeSystem = (system||"") + `
 
@@ -677,17 +801,17 @@ Format your answer with:
 Use bold, clear numbered steps. Show ALL working. Nigerian exam context throughout.`;
     try {
       const a = await callClaude(messages, showMeSystem);
-      if (a) return { answer:a, source:"Claude" };
+      if (a) return { answer:a, source:"ExamAce AI" };
     } catch(e) { console.error("Claude show-me:", e.message); }
     // Fall through to normal chain if Claude fails
   }
 
   // ── Clarification → Claude ────────────────────────────────────────────────
-  if (clarify && ANTHROPIC_KEY) {
+  if (clarify && isClaudeAvailable()) {
     console.log("🔄 Clarification → Claude");
     try {
       const a = await callClaude(messages, system);
-      if (a) return { answer:a, source:"Claude" };
+      if (a) return { answer:a, source:"ExamAce AI" };
     } catch(e) { console.error("Claude clarify:", e.message); }
   }
 
@@ -704,8 +828,8 @@ Use bold, clear numbered steps. Show ALL working. Nigerian exam context througho
     const dScore = scoreAnswer(dAns);
     console.log(`📊 Gemini: ${gScore} pts | DeepSeek: ${dScore} pts`);
 
-    const best = gScore >= dScore ? { answer:gAns, score:gScore, source:"Gemini" }
-                                  : { answer:dAns, score:dScore, source:"DeepSeek" };
+    const best = gScore >= dScore ? { answer:gAns, score:gScore, source:"ExamAce AI" }
+                                  : { answer:dAns, score:dScore, source:"ExamAce AI" };
 
     if (best.score >= 80) {
       console.log(`✅ Best STEM answer: ${best.source} (${best.score} pts)`);
@@ -723,13 +847,13 @@ Use bold, clear numbered steps. Show ALL working. Nigerian exam context througho
         {name:"Gemini",   key:GEMINI_KEY,    fn:()=>callGemini(messages,system)},
         {name:"DeepSeek", key:DEEPSEEK_KEY,  fn:()=>callDeepSeek(messages,system)},
         {name:"Groq",     key:GROQ_KEY,      fn:()=>callGroq(messages,system)},
-        {name:"Claude",   key:ANTHROPIC_KEY, fn:()=>callClaude(messages,system)},
+        {name:"Claude",   key:isClaudeAvailable()?ANTHROPIC_KEY:null, fn:()=>callClaude(messages,system)},
       ]
     : [
         {name:"Gemini",   key:GEMINI_KEY,    fn:()=>callGemini(messages,system)},
         {name:"Groq",     key:GROQ_KEY,      fn:()=>callGroq(messages,system)},
         {name:"DeepSeek", key:DEEPSEEK_KEY,  fn:()=>callDeepSeek(messages,system)},
-        {name:"Claude",   key:ANTHROPIC_KEY, fn:()=>callClaude(messages,system)},
+        {name:"Claude",   key:isClaudeAvailable()?ANTHROPIC_KEY:null, fn:()=>callClaude(messages,system)},
       ];
 
   let bestAnswer = "";
@@ -758,7 +882,7 @@ Use bold, clear numbered steps. Show ALL working. Nigerian exam context througho
   // Return best answer found, even if below ideal threshold
   if (bestAnswer) {
     console.log(`📤 Best available: ${bestSource} (${bestScore} pts)`);
-    return { answer:bestAnswer, source:bestSource };
+    return { answer:bestAnswer, source:"ExamAce AI" };
   }
 
   return { answer:"⚠️ Service temporarily unavailable. Please try again.", source:"Error" };
@@ -862,8 +986,8 @@ const generateQuestionsAI = async (subject, examType, year, count) => {
   // Try STEM chain (Gemini → DeepSeek → Groq → Claude) or general chain
   const stem = isSTEM(subject);
   const chain = stem
-    ? [{name:"Gemini",key:GEMINI_KEY,fn:()=>callGemini(prompt,system)},{name:"DeepSeek",key:DEEPSEEK_KEY,fn:()=>callDeepSeek(prompt,system)},{name:"Groq",key:GROQ_KEY,fn:()=>callGroq(prompt,system)},{name:"Claude",key:ANTHROPIC_KEY,fn:()=>callClaude(prompt,system)}]
-    : [{name:"Gemini",key:GEMINI_KEY,fn:()=>callGemini(prompt,system)},{name:"Groq",key:GROQ_KEY,fn:()=>callGroq(prompt,system)},{name:"DeepSeek",key:DEEPSEEK_KEY,fn:()=>callDeepSeek(prompt,system)},{name:"Claude",key:ANTHROPIC_KEY,fn:()=>callClaude(prompt,system)}];
+    ? [{name:"Gemini",key:GEMINI_KEY,fn:()=>callGemini(prompt,system)},{name:"DeepSeek",key:DEEPSEEK_KEY,fn:()=>callDeepSeek(prompt,system)},{name:"Groq",key:GROQ_KEY,fn:()=>callGroq(prompt,system)},{name:"Claude",key:isClaudeAvailable()?ANTHROPIC_KEY:null,fn:()=>callClaude(prompt,system)}]
+    : [{name:"Gemini",key:GEMINI_KEY,fn:()=>callGemini(prompt,system)},{name:"Groq",key:GROQ_KEY,fn:()=>callGroq(prompt,system)},{name:"DeepSeek",key:DEEPSEEK_KEY,fn:()=>callDeepSeek(prompt,system)},{name:"Claude",key:isClaudeAvailable()?ANTHROPIC_KEY:null,fn:()=>callClaude(prompt,system)}];
 
   for (const {name,key,fn} of chain) {
     if (!key) continue;
@@ -1169,12 +1293,12 @@ app.post("/api/chat/stream", rateLimit(30, 60*1000), async (req, res) => {
                 try {
                   const chunk = JSON.parse(line.slice(6));
                   const text = chunk.candidates?.[0]?.content?.parts?.[0]?.text;
-                  if (text) send({ type:"token", text, source:"Gemini" });
+                  if (text) send({ type:"token", text, source:"ExamAce AI" });
                 } catch {}
               }
             }
           }
-          send({ type:"done", source:"Gemini" });
+          send({ type:"done", source:"ExamAce AI" });
           return res.end();
         }
       } catch(e) { console.warn("Gemini stream failed, falling back:", e.message); }
@@ -1190,7 +1314,7 @@ app.post("/api/chat/stream", rateLimit(30, 60*1000), async (req, res) => {
       send({ type:"token", text: chunk, source });
       await new Promise(r => setTimeout(r, 25)); // small delay for streaming feel
     }
-    send({ type:"done", source });
+    send({ type:"done", source:"ExamAce AI" });
     res.end();
   } catch(err) {
     send({ type:"error", text:"⚠️ Service temporarily unavailable." });
@@ -1222,9 +1346,197 @@ app.post("/api/report-question", async (req, res) => {
   }
 });
 
+// ── CAREER COUNSELLING — Claude handles all counselling (best for nuanced advice)
+app.post("/api/career", rateLimit(20, 60*1000), async (req, res) => {
+  const { message, history=[], profile={} } = req.body;
+  if(!message) return res.status(400).json({error:"Message required"});
+
+  const { exam="WAEC", subjects=[], state="" } = profile;
+  const safeMsg = sanitize(message, 800);
+
+  const CAREER_SYSTEM = `You are ExamAce Career Advisor, a warm and knowledgeable Nigerian career counsellor helping secondary school students (SS1-SS3) preparing for WAEC/NECO/JAMB.
+
+Student profile:
+- Target exam: ${exam}
+- Subjects: ${subjects.join(", ")||"Not specified"}
+- State: ${state||"Nigeria"}
+
+Your role:
+1. Help students discover career paths based on their subject combinations and interests
+2. Explain JAMB subject requirements for specific courses (Medicine needs Biology+Chemistry+Physics+English)
+3. Advise on university choices — federal, state, private — realistic for their profile
+4. Explain O'Level credit requirements (minimum 5 credits including English & Maths for most courses)
+5. Discuss post-JAMB options: polytechnics, colleges of education, direct entry
+6. Be honest about competitive courses (Medicine, Law, Engineering) vs less competitive ones
+7. Connect subjects they're studying to real career outcomes in Nigeria
+8. Address common fears: "my parents want me to do Medicine but I want to study Mass Comm"
+
+Always:
+- Use Nigerian universities as examples (UNILAG, UI, OAU, ABU, UNIBEN, etc.)
+- Reference JAMB CAPS, admission portal, NYSC realistically
+- Be warm, encouraging and realistic — not a yes-machine
+- Keep answers focused and under 200 words unless a topic genuinely needs more
+- Never be preachy or lecture-heavy
+
+Do NOT:
+- Recommend foreign universities (focus is Nigeria)
+- Give generic "follow your passion" advice without practical steps
+- Pretend all courses are equally competitive`;
+
+  const msgs = [
+    ...history.slice(-6).map(h => ({role:h.role,content:h.content})),
+    {role:"user", content:safeMsg}
+  ];
+
+  try {
+    // Career counselling always uses the best available AI for nuanced advice
+    let answer = "";
+    if (isClaudeAvailable()) {
+      try { answer = await callClaude(msgs, CAREER_SYSTEM); } catch(e) { console.error("Claude career:", e.message); }
+    }
+    if (!answer && GEMINI_KEY) {
+      try { answer = await callGemini(msgs, CAREER_SYSTEM); } catch(e) { console.error("Gemini career:", e.message); }
+    }
+    if (!answer && DEEPSEEK_KEY) {
+      try { answer = await callDeepSeek(msgs, CAREER_SYSTEM); } catch(e) {}
+    }
+    if (!answer) answer = "I'm having trouble connecting right now. Please try again in a moment.";
+
+    res.json({ answer, source:"ExamAce AI" });
+  } catch(e) {
+    res.status(500).json({ error:"Career advisor temporarily unavailable." });
+  }
+});
+
+// ── DAILY QUESTION ─────────────────────────────────────────────────────────────
+// Returns a deterministic "question of the day" based on today's date
+// Same question for all students on the same day (creates shared experience)
+app.get("/api/daily-question", rateLimit(60, 60*1000), async (req, res) => {
+  const { subject, exam="WAEC" } = req.query;
+
+  // Use date as seed — everyone gets the same question today
+  const today = new Date().toISOString().slice(0,10);
+  const cacheKey = `daily|${subject||"general"}|${exam}|${today}`;
+
+  // Check question cache first
+  const cached = cacheGet(cacheKey);
+  if (cached && cached.length > 0) {
+    return res.json({ question: cached[0], date: today, source:"ExamAce AI" });
+  }
+
+  try {
+    // Fetch a fresh past question
+    const alocSubject = ALOC_SUBJECT_MAP[(subject||"mathematics").toLowerCase()] || "mathematics";
+    const qs = await fetchALOC(alocSubject, "utme", null, 5);
+    if (qs && qs.length > 0) {
+      // Pick question based on date hash for determinism
+      const idx = new Date().getDate() % qs.length;
+      const q = normaliseALOC(qs[idx]);
+      cacheSet(cacheKey, [q]);
+      return res.json({ question: q, date: today, source:"ExamAce AI" });
+    }
+  } catch(e) { console.error("Daily question ALOC:", e.message); }
+
+  // AI fallback if ALOC fails
+  try {
+    const prompt = `Generate ONE authentic ${exam} past-question style MCQ for ${subject||"Mathematics"}.
+Respond with valid JSON only:
+{"q":"question text","options":{"A":"...","B":"...","C":"...","D":"..."},"answer":"A","explanation":"why A is correct","topic":"topic name"}`;
+    const text = await callGemini([{role:"user",content:prompt}], "Return valid JSON only, no markdown.");
+    const clean = text.replace(/\`\`\`json|\`\`\`/g,"").trim();
+    const q = JSON.parse(clean);
+    return res.json({ question: q, date: today, source:"ExamAce AI" });
+  } catch(e) {
+    res.status(500).json({ error:"Could not load daily question." });
+  }
+});
+
 // ── CACHE STATS ────────────────────────────────────────────────────────────────
 app.get("/cache-stats", (req, res) => {
   res.json({ status:"✅", cache: cacheStats() });
+});
+
+// ── AI HEALTH STATUS — check which AI tiers are live right now ─────────────────
+app.get("/ai-status", (req, res) => {
+  res.json({
+    timestamp: new Date().toISOString(),
+    tiers: {
+      gemini:   { available: !!GEMINI_KEY,   status: GEMINI_KEY   ? "✅ Active" : "❌ No key" },
+      deepseek: { available: !!DEEPSEEK_KEY, status: DEEPSEEK_KEY ? "✅ Active" : "❌ No key" },
+      groq:     { available: !!GROQ_KEY,     status: GROQ_KEY     ? "✅ Active" : "❌ No key" },
+      claude:   {
+        available: isClaudeAvailable(),
+        status: !ANTHROPIC_KEY        ? "❌ No key"
+              : claudeState.disabled  ? `⚠️ Circuit breaker OPEN — ${claudeState.disabledReason}`
+              : `✅ Active (${claudeState.callsToday}/${claudeState.MAX_DAILY} calls today)`,
+        disabledAt:     claudeState.disabledAt ? new Date(claudeState.disabledAt).toISOString() : null,
+        retryInMinutes: claudeState.disabled && claudeState.disabledAt
+          ? Math.max(0, Math.round((claudeState.reCheckMs - (Date.now() - claudeState.disabledAt)) / 60000))
+          : null,
+        lastError:      claudeState.lastError || null,
+        failCount:      claudeState.failCount,
+      },
+    },
+    challenge_store: { active: challengeStore.size },
+    question_cache:  cacheStats(),
+    uptime_seconds:  Math.round(process.uptime()),
+  });
+});
+
+// ── AI STATUS & HEALTH MONITOR ────────────────────────────────────────────────
+// Check this URL to monitor AI tier health and Claude credit status
+// Visit: /api/status
+app.get("/api/status", (req, res) => {
+  const db = readDB();
+  res.json({
+    status:    "✅ ExamAce AI running",
+    timestamp: new Date().toISOString(),
+    ai_tiers: {
+      gemini:   GEMINI_KEY    ? "✅ configured" : "❌ missing GEMINI_API_KEY",
+      deepseek: DEEPSEEK_KEY  ? "✅ configured" : "❌ missing DEEPSEEK_API_KEY",
+      groq:     GROQ_KEY      ? "✅ configured" : "❌ missing GROQ_API_KEY",
+      claude: {
+        configured: !!ANTHROPIC_KEY,
+        available:  isClaudeAvailable(),
+        disabled:   claudeState.disabled,
+        reason:     claudeState.disabledReason || "none",
+        callsToday: claudeState.callsToday,
+        dailyLimit: claudeState.MAX_DAILY,
+        lastError:  claudeState.lastError || "none",
+        reEnablesIn: claudeState.disabled && claudeState.disabledAt
+          ? Math.max(0, Math.round((claudeState.reCheckMs - (Date.now() - claudeState.disabledAt)) / 60000)) + " minutes"
+          : "n/a",
+      }
+    },
+    users:    Object.keys(db.users||{}).length,
+    cache:    cacheStats(),
+    uptime:   Math.round(process.uptime() / 60) + " minutes",
+    memory:   Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + " MB",
+  });
+});
+
+// ── AI BUDGET STATUS — monitor Claude usage and fallback state ─────────────────
+app.get("/api/budget", (req, res) => {
+  res.json({
+    claude: {
+      available:    isClaudeAvailable(),
+      disabled:     claudeState.disabled,
+      reason:       claudeState.disabledReason || "none",
+      callsToday:   claudeState.callsToday,
+      errorsToday:  claudeState.errorsToday,
+      dailyCap:     claudeState.MAX_DAILY,
+      pctUsed:      Math.round((claudeState.callsToday / claudeState.MAX_DAILY) * 100),
+      resetsAt:     "midnight UTC",
+    },
+    fallbacks: {
+      gemini:   !!GEMINI_KEY,
+      deepseek: !!DEEPSEEK_KEY,
+      groq:     !!GROQ_KEY,
+    },
+    message: claudeState.disabled
+      ? `⚠️ Claude offline (${claudeState.disabledReason}). App running on fallback — no student impact.`
+      : `✅ All systems operational`,
+  });
 });
 
 // ── HEALTH CHECK ──────────────────────────────────────────────────────────────
@@ -1239,7 +1551,10 @@ app.get("/", (req, res) => {
       "Tier 1":  GEMINI_KEY    ? "✅ Gemini 2.0 Flash"     : "❌ Missing GEMINI_API_KEY",
       "Tier 2":  DEEPSEEK_KEY  ? "✅ DeepSeek V3"          : "❌ Missing DEEPSEEK_API_KEY",
       "Tier 3":  GROQ_KEY      ? "✅ Groq (Llama 3.3 70B)" : "❌ Missing GROQ_API_KEY",
-      "Tier 4":  ANTHROPIC_KEY ? "✅ Claude Sonnet"         : "❌ Missing ANTHROPIC_API_KEY",
+      "Tier 4":  !ANTHROPIC_KEY ? "❌ Missing ANTHROPIC_API_KEY"
+                 : claudeState.disabled
+                   ? `⚠️  Claude disabled (${claudeState.lastError}) — auto-retry in ${Math.round((claudeState.reCheckMs - (Date.now()-claudeState.disabledAt))/60000)}min`
+                   : `✅ Claude Sonnet (failures: ${claudeState.failCount})`,
     },
     endpoints: {
       "GET  /api/questions":       "Fetch hybrid questions (ALOC + AI fallback)",
@@ -1484,6 +1799,171 @@ app.get("/api/leaderboard", (req, res) => {
     .sort((a,b) => b.xp - a.xp)
     .slice(0, parseInt(limit));
   res.json({ board });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CHALLENGE LINK SYSTEM
+// Flow: Logged-in student creates challenge → gets shareable link
+//       Friend opens link → plays 10 questions as guest (no account needed)
+//       Both scores shown side by side → friend prompted to sign up
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// In-memory challenge store — { challengeId: { ...challengeData } }
+// Challenges expire after 72 hours
+const challengeStore = new Map();
+const CHALLENGE_TTL = 72 * 60 * 60 * 1000;
+
+// Clean up expired challenges every hour
+setInterval(() => {
+  const cutoff = Date.now() - CHALLENGE_TTL;
+  for (const [id, c] of challengeStore) {
+    if (c.createdAt < cutoff) challengeStore.delete(id);
+  }
+}, 60 * 60 * 1000);
+
+// ── CREATE CHALLENGE ──────────────────────────────────────────────────────────
+// Logged-in student creates a challenge after a good score
+// Returns a challenge ID + shareable link
+app.post("/api/challenge/create", auth, rateLimit(10, 60*60*1000), async (req, res) => {
+  const { subject, exam, year, score, total, pct, questions } = req.body;
+
+  if (!subject || !questions?.length) {
+    return res.status(400).json({ error: "Subject and questions required" });
+  }
+
+  // Sanitize questions — strip correct answers before storing (sent to guest separately)
+  const safeQuestions = questions.slice(0, 10).map(q => ({
+    id:       q.id || "",
+    q:        sanitize(q.q || "", 500),
+    options:  {
+      A: sanitize(q.options?.A || "", 200),
+      B: sanitize(q.options?.B || "", 200),
+      C: sanitize(q.options?.C || "", 200),
+      D: sanitize(q.options?.D || "", 200),
+    },
+    answer:      q.answer,
+    explanation: sanitize(q.explanation || "", 400),
+    topic:       sanitize(q.topic || "", 100),
+    source:      q.source || "ALOC",
+  }));
+
+  const db = readDB();
+  const challenger = db.users[req.user.email];
+
+  // Generate short unique ID
+  const challengeId = Math.random().toString(36).slice(2, 8).toUpperCase();
+
+  challengeStore.set(challengeId, {
+    challengeId,
+    challenger: {
+      name:    challenger?.name || "A friend",
+      score,
+      total:   total || safeQuestions.length,
+      pct:     pct || Math.round((score / (total || 10)) * 100),
+      level:   getLevel(challenger?.xp || 0),
+      subject,
+      exam,
+    },
+    questions:  safeQuestions,
+    subject,
+    exam,
+    year:       year || null,
+    attempts:   [],
+    createdAt:  Date.now(),
+  });
+
+  res.json({
+    challengeId,
+    shareUrl: `/challenge/${challengeId}`,
+    message:  `Challenge created! Share this link with friends.`,
+  });
+});
+
+// ── GET CHALLENGE (guest fetches questions) ───────────────────────────────────
+app.get("/api/challenge/:id", rateLimit(60, 60*1000), (req, res) => {
+  const challenge = challengeStore.get(req.params.id?.toUpperCase());
+  if (!challenge) return res.status(404).json({ error: "Challenge not found or expired" });
+  if (Date.now() - challenge.createdAt > CHALLENGE_TTL) {
+    challengeStore.delete(req.params.id);
+    return res.status(410).json({ error: "This challenge has expired" });
+  }
+  // Return questions WITHOUT answers — answers sent only after submission
+  const questionsForGuest = challenge.questions.map(q => ({
+    id: q.id, q: q.q, options: q.options, topic: q.topic, source: q.source,
+  }));
+  res.json({
+    challengeId:  challenge.challengeId,
+    challenger:   challenge.challenger,
+    questions:    questionsForGuest,
+    subject:      challenge.subject,
+    exam:         challenge.exam,
+    year:         challenge.year,
+    totalQ:       challenge.questions.length,
+  });
+});
+
+// ── SUBMIT CHALLENGE ATTEMPT ──────────────────────────────────────────────────
+// Guest submits answers → gets results + answers revealed + signup prompt
+app.post("/api/challenge/:id/submit", rateLimit(20, 60*1000), (req, res) => {
+  const challenge = challengeStore.get(req.params.id?.toUpperCase());
+  if (!challenge) return res.status(404).json({ error: "Challenge not found or expired" });
+
+  const { answers, guestName } = req.body;
+  if (!answers || typeof answers !== "object") {
+    return res.status(400).json({ error: "Answers required" });
+  }
+
+  // Grade the attempt
+  let correct = 0;
+  const results = challenge.questions.map((q, i) => {
+    const given = answers[i] || answers[String(i)];
+    const isCorrect = given === q.answer;
+    if (isCorrect) correct++;
+    return {
+      q:           q.q,
+      options:     q.options,
+      given,
+      answer:      q.answer,
+      explanation: q.explanation,
+      correct:     isCorrect,
+    };
+  });
+
+  const total = challenge.questions.length;
+  const pct   = Math.round((correct / total) * 100);
+  const name  = sanitize(guestName || "You", 60);
+
+  // Store attempt (for challenger to see later — max 50)
+  challenge.attempts = [{
+    name, correct, total, pct, ts: Date.now()
+  }, ...(challenge.attempts || [])].slice(0, 50);
+
+  const challenger = challenge.challenger;
+  const beat = correct > challenger.score;
+  const tied = correct === challenger.score;
+
+  res.json({
+    results,
+    summary: {
+      guestName:   name,
+      correct,
+      total,
+      pct,
+      beat,
+      tied,
+      challenger: {
+        name:  challenger.name,
+        score: challenger.score,
+        pct:   challenger.pct,
+      },
+      message: beat
+        ? `🏆 You beat ${challenger.name}! (${correct} vs ${challenger.score})`
+        : tied
+        ? `🤝 It's a tie! You both scored ${correct}/${total}`
+        : `${challenger.name} beat you (${challenger.score} vs ${correct}) — challenge them again!`,
+      signupPrompt: "Save your score and track your progress — create a free ExamAce account",
+    },
+  });
 });
 
 // ── TEST ALOC CONNECTIVITY ────────────────────────────────────────────────────
