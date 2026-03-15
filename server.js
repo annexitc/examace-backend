@@ -24,14 +24,24 @@ app.use((req, res, next) => {
 // In-memory rate limiter — no extra package needed
 const _rls = new Map();
 const _cleanup = setInterval(() => { const c=Date.now()-600000; for(const [k,v] of _rls) if(v.start<c) _rls.delete(k); }, 600000);
-const rateLimit = (max, windowMs) => (req, res, next) => {
-  const key = req.ip || 'unknown';
+
+// Get real client IP — Render (and most cloud hosts) put the real IP in x-forwarded-for
+const getRealIP = (req) => {
+  const fwd = req.headers['x-forwarded-for'];
+  if (fwd) return fwd.split(',')[0].trim();
+  return req.ip || req.connection?.remoteAddress || 'unknown';
+};
+
+// rateLimit(max, windowMs, keyFn?)
+// keyFn defaults to real IP — auth routes pass email to avoid shared-IP false positives on Render
+const rateLimit = (max, windowMs, keyFn) => (req, res, next) => {
+  const key = keyFn ? keyFn(req) : `ip:${getRealIP(req)}`;
   const now = Date.now();
   const d   = _rls.get(key) || {count:0,start:now};
   if (now - d.start > windowMs) { d.count=0; d.start=now; }
   d.count++;
   _rls.set(key, d);
-  if (d.count > max) return res.status(429).json({error:'Too many requests. Please slow down and try again.'});
+  if (d.count > max) return res.status(429).json({error:'Too many requests. Please wait a moment and try again.'});
   next();
 };
 
@@ -1130,7 +1140,7 @@ const fetchHybridQuestions = async (subject, examType, year, count) => {
 // ── GET QUESTIONS (hybrid ALOC + AI) ─────────────────────────────────────────
 // Used by frontend Quiz and JAMB CBT components
 // Query params: subject, exam (waec|jamb|neco), year, count
-app.get("/api/questions", rateLimit(30, 60*1000), async (req, res) => {
+app.get("/api/questions", rateLimit(200, 60*1000), async (req, res) => {
   const { subject, exam, year, count } = req.query;
 
   if (!subject) return res.status(400).json({ error: "subject is required" });
@@ -1251,7 +1261,7 @@ Always end with a relevant exam tip or next action.`;
 
 // ── STREAMING CHAT ENDPOINT (token-by-token via SSE) ─────────────────────────
 // Frontend connects with EventSource, answers stream word-by-word
-app.post("/api/chat/stream", rateLimit(30, 60*1000), async (req, res) => {
+app.post("/api/chat/stream", rateLimit(150, 60*1000), async (req, res) => {
   const { messages, system, imgData } = req.body;
 
   res.setHeader("Content-Type",  "text/event-stream");
@@ -1573,7 +1583,7 @@ app.get("/", (req, res) => {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // ── REGISTER ─────────────────────────────────────────────────────────────────
-app.post("/api/auth/register", rateLimit(5, 15*60*1000), async (req, res) => {
+app.post("/api/auth/register", rateLimit(10, 60*60*1000, req => `reg:${(req.body?.email||"").toLowerCase().trim()}`), async (req, res) => {
   const rawName  = sanitize(req.body.name,    100);
   const rawEmail = sanitize(req.body.email,   254).toLowerCase();
   const password = typeof req.body.password === "string" ? req.body.password.slice(0,128) : "";
@@ -1620,7 +1630,7 @@ app.post("/api/auth/register", rateLimit(5, 15*60*1000), async (req, res) => {
 });
 
 // ── LOGIN ─────────────────────────────────────────────────────────────────────
-app.post("/api/auth/login", rateLimit(10, 15*60*1000), async (req, res) => {
+app.post("/api/auth/login", rateLimit(15, 15*60*1000, req => `login:${(req.body?.email||"").toLowerCase().trim()}`), async (req, res) => {
   const email    = sanitize(req.body.email, 254).toLowerCase();
   const password = typeof req.body.password === "string" ? req.body.password.slice(0,128) : "";
   if(!email||!password) return res.status(400).json({error:"Email and password required"});
@@ -1880,7 +1890,7 @@ app.post("/api/challenge/create", auth, rateLimit(10, 60*60*1000), async (req, r
 });
 
 // ── GET CHALLENGE (guest fetches questions) ───────────────────────────────────
-app.get("/api/challenge/:id", rateLimit(60, 60*1000), (req, res) => {
+app.get("/api/challenge/:id", rateLimit(300, 60*1000), (req, res) => {
   const challenge = challengeStore.get(req.params.id?.toUpperCase());
   if (!challenge) return res.status(404).json({ error: "Challenge not found or expired" });
   if (Date.now() - challenge.createdAt > CHALLENGE_TTL) {
