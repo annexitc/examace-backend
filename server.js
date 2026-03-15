@@ -590,10 +590,8 @@ const scoreAnswer = (text) => {
     if (rx.test(text)) score -= 80;
   }
   // Structural bonuses
-  if (text.includes("
-"))       score += 15;  // has line breaks = structured
-  if (text.split("
-").length>4) score += 20;  // multi-paragraph
+  if (text.includes("\n"))        score += 15;  // has line breaks = structured
+  if (text.split("\n").length>4)  score += 20;  // multi-paragraph
   if (/\d/.test(text))           score += 10;  // contains numbers
 
   return Math.max(score, 0);
