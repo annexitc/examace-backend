@@ -1593,7 +1593,7 @@ app.post("/api/auth/register", rateLimit(5, 15*60*1000), async (req, res) => {
   const userId = `u_${Date.now()}_${Math.random().toString(36).slice(2,7)}`;
   const profile = {
     userId, name, email:email.toLowerCase(), hash,
-    exam: exam||"WAEC", subjects, state,
+    exam: exam||"WAEC", examYear: examYear||"This year (2026)", subjects, state,
     xp:25, xpLog:[{reason:"Welcome bonus",amount:25,ts:Date.now()}],
     achievements:[],
     currentStreak:0, longestStreak:0, lastStudyDate:null, totalStudyDays:0,
@@ -1645,7 +1645,7 @@ app.post("/api/auth/login", rateLimit(10, 15*60*1000), async (req, res) => {
   res.json({
     token,
     user:{ userId:profile.userId, name:profile.name, email:email.toLowerCase(),
-      exam:profile.exam, subjects:profile.subjects||[], state:profile.state||"",
+      exam:profile.exam, examYear:profile.examYear||"This year (2026)", subjects:profile.subjects||[], state:profile.state||"",
       xp:withAch.xp, level:levelInfo, achievements:withAch.achievements,
       currentStreak:withAch.currentStreak, longestStreak:withAch.longestStreak,
       lastStudyDate:withAch.lastStudyDate, totalStudyDays:withAch.totalStudyDays,
