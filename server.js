@@ -1584,11 +1584,12 @@ app.get("/", (req, res) => {
 
 // ── REGISTER ─────────────────────────────────────────────────────────────────
 app.post("/api/auth/register", rateLimit(10, 60*60*1000, req => `reg:${(req.body?.email||"").toLowerCase().trim()}`), async (req, res) => {
-  const rawName  = sanitize(req.body.name,    100);
-  const rawEmail = sanitize(req.body.email,   254).toLowerCase();
+  const rawName  = sanitize(req.body.name,      100);
+  const rawEmail = sanitize(req.body.email,     254).toLowerCase();
   const password = typeof req.body.password === "string" ? req.body.password.slice(0,128) : "";
-  const exam     = sanitize(req.body.exam,     20) || "WAEC";
-  const state    = sanitize(req.body.state,    60);
+  const exam     = sanitize(req.body.exam,       20) || "WAEC";
+  const examYear = sanitize(req.body.examYear||"", 30) || "This year (2026)";
+  const state    = sanitize(req.body.state,      60);
   const subjects = Array.isArray(req.body.subjects) ? req.body.subjects.map(s=>sanitize(s,60)).slice(0,12) : [];
 
   const name = rawName, email = rawEmail;
