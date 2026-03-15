@@ -2009,5 +2009,21 @@ app.get("/debug-aloc", async (req, res) => {
   }
 });
 
+// ── 404 HANDLER ───────────────────────────────────────────────────────────────
+app.use((req, res) => {
+  res.status(404).json({ error: `Route ${req.method} ${req.path} not found` });
+});
+
+// ── GLOBAL ERROR HANDLER — always returns JSON, never HTML ────────────────────
+app.use((err, req, res, next) => {
+  console.error("Unhandled error:", err.message);
+  const status = err.status || err.statusCode || 500;
+  res.status(status).json({
+    error: process.env.NODE_ENV === "production"
+      ? "An unexpected error occurred. Please try again."
+      : err.message,
+  });
+});
+
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => console.log(`✅ ExamAce AI backend running on port ${PORT}`));
