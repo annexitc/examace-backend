@@ -1,8 +1,149 @@
 const express = require("express");
 const cors    = require("cors");
+const fs      = require("fs");
+const path    = require("path");
+const bcrypt  = require("bcryptjs");
+const jwt     = require("jsonwebtoken");
 
 const app = express();
-app.use(cors());
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// USER PROFILE & GAMIFICATION — JSON file store + JWT auth
+// ═══════════════════════════════════════════════════════════════════════════════
+const JWT_SECRET = process.env.JWT_SECRET || "examace-secret-change-in-prod";
+const DB_PATH    = process.env.DB_PATH    || path.join(__dirname, "data", "users.json");
+if (!fs.existsSync(path.dirname(DB_PATH))) fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
+
+const readDB  = () => { try { return JSON.parse(fs.readFileSync(DB_PATH,"utf8")); } catch { return {users:{}}; } };
+const writeDB = (d) => { try { fs.writeFileSync(DB_PATH, JSON.stringify(d,null,2)); } catch(e) { console.error("DB:",e.message); } };
+
+const XP_RULES = {
+  correct:10, wrong:2, quiz_done:25, cbt_done:60,
+  streak_bonus:15, perfect_score:40, first_login:25,
+};
+
+const LEVELS = [
+  {level:1, name:"JSS3 Student",    minXP:0,    badge:"🌱", color:"#22c55e"},
+  {level:2, name:"SS1 Learner",     minXP:100,  badge:"📚", color:"#38bdf8"},
+  {level:3, name:"SS2 Scholar",     minXP:300,  badge:"⭐", color:"#a855f7"},
+  {level:4, name:"SS3 Candidate",   minXP:600,  badge:"🎯", color:"#f97316"},
+  {level:5, name:"WAEC Ready",      minXP:1000, badge:"🏅", color:"#f5c842"},
+  {level:6, name:"JAMB Champion",   minXP:1500, badge:"🏆", color:"#f5c842"},
+  {level:7, name:"A1 Legend",       minXP:2500, badge:"👑", color:"#ef4444"},
+  {level:8, name:"ExamAce Master",  minXP:4000, badge:"💎", color:"#a855f7"},
+];
+
+const ACHIEVEMENTS = [
+  {id:"first_quiz",    name:"First Step",      desc:"Complete your first quiz",              icon:"🎯", xp:10 },
+  {id:"streak_3",      name:"Hat Trick",        desc:"3-day study streak",                    icon:"🔥", xp:20 },
+  {id:"streak_7",      name:"Week Warrior",     desc:"7-day study streak",                    icon:"⚡", xp:50 },
+  {id:"streak_30",     name:"Iron Student",     desc:"30-day study streak",                   icon:"💪", xp:150},
+  {id:"perfect_quiz",  name:"Perfectionist",    desc:"Score 100% on any quiz",               icon:"💯", xp:30 },
+  {id:"cbt_first",     name:"CBT Debut",        desc:"Complete your first JAMB CBT mock",    icon:"🖥️", xp:50 },
+  {id:"cbt_280",       name:"Uni Ready",        desc:"Score 280+ in JAMB CBT",               icon:"🎓", xp:80 },
+  {id:"cbt_300",       name:"Admission Ready",  desc:"Score 300+ in JAMB CBT",               icon:"🏛️", xp:120},
+  {id:"q100",          name:"Century Mark",     desc:"Answer 100 questions total",            icon:"💯", xp:40 },
+  {id:"q500",          name:"Question Master",  desc:"Answer 500 questions total",            icon:"🌟", xp:100},
+  {id:"q1000",         name:"Question Legend",  desc:"Answer 1,000 questions total",          icon:"🔱", xp:200},
+  {id:"subjects_5",    name:"All-Rounder",      desc:"Practice 5 different subjects",         icon:"📚", xp:50 },
+  {id:"waec_a1",       name:"A1 Achiever",      desc:"Score 75%+ on any WAEC quiz",          icon:"🏆", xp:60 },
+  {id:"review_10",     name:"Disciplined",      desc:"Complete 10 spaced repetition reviews", icon:"🔁", xp:30 },
+  {id:"review_50",     name:"Memory Master",    desc:"Complete 50 spaced repetition reviews", icon:"🧠", xp:80 },
+];
+
+const getLevel = (xp=0) => {
+  const lvl  = [...LEVELS].reverse().find(l => xp >= l.minXP) || LEVELS[0];
+  const next = LEVELS.find(l => l.minXP > xp);
+  return { ...lvl, nextXP: next?.minXP||null, xpToNext: next?next.minXP-xp:0,
+    progress: next ? Math.round(((xp-lvl.minXP)/(next.minXP-lvl.minXP))*100) : 100 };
+};
+
+const awardXP = (profile, reason, amount) => {
+  profile.xp = (profile.xp||0) + amount;
+  if (!profile.xpLog) profile.xpLog = [];
+  profile.xpLog = [{reason,amount,ts:Date.now()}, ...profile.xpLog].slice(0,100);
+  return profile;
+};
+
+const checkAchievements = (profile, extras=[]) => {
+  profile.achievements = profile.achievements || [];
+  const s = profile.stats || {};
+  const has = (id) => profile.achievements.includes(id);
+  const newly = [];
+  const maybe = (id, cond) => { if(!has(id) && cond) newly.push(id); };
+
+  maybe("first_quiz",   (s.quizzesCompleted||0)>=1);
+  maybe("streak_3",     (s.longestStreak||0)>=3);
+  maybe("streak_7",     (s.longestStreak||0)>=7);
+  maybe("streak_30",    (s.longestStreak||0)>=30);
+  maybe("cbt_first",    (s.cbtCompleted||0)>=1);
+  maybe("cbt_280",      (s.bestJAMB||0)>=280);
+  maybe("cbt_300",      (s.bestJAMB||0)>=300);
+  maybe("q100",         (s.totalAnswered||0)>=100);
+  maybe("q500",         (s.totalAnswered||0)>=500);
+  maybe("q1000",        (s.totalAnswered||0)>=1000);
+  maybe("subjects_5",   Object.keys(s.subjectsPracticed||{}).length>=5);
+  maybe("review_10",    (s.reviewsCompleted||0)>=10);
+  maybe("review_50",    (s.reviewsCompleted||0)>=50);
+  extras.forEach(id => maybe(id, true));
+
+  const earned = [];
+  newly.forEach(id => {
+    const a = ACHIEVEMENTS.find(x => x.id===id);
+    if(a){ profile.achievements.push(id); awardXP(profile,`Achievement: ${a.name}`,a.xp); earned.push(a); }
+  });
+  return { profile, earned };
+};
+
+// Update streak logic
+const updateStreak = (profile) => {
+  const today = new Date().toDateString();
+  const yest  = new Date(Date.now()-86400000).toDateString();
+  if (profile.lastStudyDate === today) return { profile, bonus: false };
+  const continued = profile.lastStudyDate === yest;
+  profile.currentStreak = continued ? (profile.currentStreak||0)+1 : 1;
+  profile.longestStreak = Math.max(profile.longestStreak||0, profile.currentStreak);
+  profile.lastStudyDate = today;
+  profile.stats = profile.stats || {};
+  profile.stats.longestStreak = profile.longestStreak;
+  profile.totalStudyDays = (profile.totalStudyDays||0)+1;
+  awardXP(profile, "Daily study streak", XP_RULES.streak_bonus);
+  return { profile, bonus: true };
+};
+
+// Auth middleware
+const auth = (req, res, next) => {
+  const token = (req.headers.authorization||"").replace("Bearer ","");
+  if(!token) return res.status(401).json({error:"Login required"});
+  try { req.user = jwt.verify(token, JWT_SECRET); next(); }
+  catch { res.status(401).json({error:"Session expired — please log in again"}); }
+};
+
+
+// CORS — allow requests from your frontend Render domain (and localhost for dev)
+const ALLOWED_ORIGINS = [
+  "http://localhost:3000",
+  "http://localhost:5173",
+  "http://localhost:5174",
+  // Add your actual frontend Render URL below:
+  "https://examace-ai.onrender.com",   // ← change this to your frontend URL
+  // If you have a custom domain, add it too:
+  // "https://www.examace.ng",
+];
+
+app.use(cors({
+  origin: (origin, callback) => {
+    // Allow requests with no origin (mobile apps, curl, Postman, WhatsApp webhook)
+    if (!origin) return callback(null, true);
+    if (ALLOWED_ORIGINS.some(o => origin.startsWith(o))) return callback(null, true);
+    console.warn(`CORS blocked: ${origin}`);
+    callback(new Error(`CORS: origin ${origin} not allowed`));
+  },
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+  credentials: true,
+}));
+
 app.use(express.json({ limit: "10mb" }));
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -61,6 +202,28 @@ const ALOC_AVAILABLE_YEARS = [
   2001,2002,2003,2004,2005,2006,2007,2008,2009,2010,
   2011,2012,2013,2014,2015,2016,2017,2018,2019,2020,
 ];
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// QUESTION CACHE — in-memory cache to avoid repeated ALOC API calls
+// Key: "subject|examType|year"  Value: { questions, ts }
+// TTL: 24 hours — ALOC data is static so we can cache aggressively
+// ═══════════════════════════════════════════════════════════════════════════════
+const questionCache = new Map();
+const CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
+
+const cacheKey  = (subject, examType, year) => `${subject}|${examType}|${year||"any"}`;
+const cacheGet  = (key) => {
+  const entry = questionCache.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.ts > CACHE_TTL) { questionCache.delete(key); return null; }
+  return entry.questions;
+};
+const cacheSet  = (key, questions) => questionCache.set(key, { questions, ts: Date.now() });
+const cacheStats = () => ({
+  entries: questionCache.size,
+  keys: [...questionCache.keys()],
+  totalQuestions: [...questionCache.values()].reduce((s,e)=>s+e.questions.length, 0),
+});
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // ALOC API CALLER
@@ -232,11 +395,25 @@ const normaliseALOC = (q, examType, subject) => {
  * ALOC max is 40 per call, so we call twice and merge/deduplicate for counts > 40
  */
 const fetchALOCBatch = async (subject, examType, year, totalCount) => {
+  const key = cacheKey(subject, examType, year);
+
+  // Check cache first
+  const cached = cacheGet(key);
+  if (cached && cached.length >= totalCount) {
+    console.log(`💾 Cache hit: ${key} (${cached.length} questions)`);
+    // Return a random sample so students don't see the same order
+    const shuffled = [...cached].sort(() => Math.random() - 0.5);
+    return shuffled.slice(0, totalCount);
+  }
+
   const results = [];
   const seenIds = new Set();
+  // Pre-fill seenIds from cache to avoid duplicates
+  if (cached) cached.forEach(q => { seenIds.add(q.id); results.push(q); });
 
   const batchSize = 40;
-  const batches   = Math.ceil(totalCount / batchSize);
+  const needed    = totalCount - results.length;
+  const batches   = Math.ceil(needed / batchSize);
 
   for (let i = 0; i < batches; i++) {
     try {
@@ -253,6 +430,12 @@ const fetchALOCBatch = async (subject, examType, year, totalCount) => {
       break;
     }
     if (results.length >= totalCount) break;
+  }
+
+  // Cache whatever we got (even if less than requested — prevents hammering API)
+  if (results.length > 0) {
+    cacheSet(key, results);
+    console.log(`💾 Cached ${results.length} questions for ${key}`);
   }
 
   return results.slice(0, totalCount);
@@ -758,6 +941,108 @@ Always end with a relevant exam tip or next action.`;
   }
 });
 
+// ── STREAMING CHAT ENDPOINT (token-by-token via SSE) ─────────────────────────
+// Frontend connects with EventSource, answers stream word-by-word
+app.post("/api/chat/stream", async (req, res) => {
+  const { messages, system, imgData } = req.body;
+
+  res.setHeader("Content-Type",  "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection",    "keep-alive");
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.flushHeaders();
+
+  const send = (data) => res.write(`data: ${JSON.stringify(data)}\n\n`);
+
+  try {
+    // Try Gemini streaming first (cheapest)
+    if (GEMINI_KEY && !imgData) {
+      try {
+        const lastMsg = typeof messages === "string" ? messages
+          : Array.isArray(messages) ? (messages[messages.length-1]?.content||"") : "";
+        const parts = [];
+        if (system) parts.push({ text: system + "\n\n" });
+        parts.push({ text: lastMsg });
+
+        const gemRes = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:streamGenerateContent?alt=sse&key=${GEMINI_KEY}`,
+          { method:"POST", headers:{"Content-Type":"application/json"},
+            body: JSON.stringify({ contents:[{parts}], generationConfig:{maxOutputTokens:1500,temperature:0.3} }) }
+        );
+
+        if (gemRes.ok) {
+          const reader = gemRes.body.getReader();
+          const decoder = new TextDecoder();
+          let buffer = "";
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split("\n");
+            buffer = lines.pop();
+            for (const line of lines) {
+              if (line.startsWith("data: ")) {
+                try {
+                  const chunk = JSON.parse(line.slice(6));
+                  const text = chunk.candidates?.[0]?.content?.parts?.[0]?.text;
+                  if (text) send({ type:"token", text, source:"Gemini" });
+                } catch {}
+              }
+            }
+          }
+          send({ type:"done", source:"Gemini" });
+          return res.end();
+        }
+      } catch(e) { console.warn("Gemini stream failed, falling back:", e.message); }
+    }
+
+    // Fallback: call smartAnswer normally and stream result in one chunk
+    const { answer, source } = await smartAnswer(messages, system, imgData);
+    // Simulate streaming by chunking the response into ~10-word pieces
+    const words = answer.split(" ");
+    const chunkSize = 8;
+    for (let i = 0; i < words.length; i += chunkSize) {
+      const chunk = words.slice(i, i + chunkSize).join(" ") + (i + chunkSize < words.length ? " " : "");
+      send({ type:"token", text: chunk, source });
+      await new Promise(r => setTimeout(r, 25)); // small delay for streaming feel
+    }
+    send({ type:"done", source });
+    res.end();
+  } catch(err) {
+    send({ type:"error", text:"⚠️ Service temporarily unavailable." });
+    res.end();
+  }
+});
+
+// ── ALOC QUESTION REPORT (students flag bad questions) ────────────────────────
+// Body: { questionId, subject, type, message }
+// type: 1=question, 2=optA, 3=optB, 4=optC, 5=optD, 6=answer, 7=solution
+app.post("/api/report-question", async (req, res) => {
+  const { questionId, subject, type=1, message="" } = req.body;
+  if (!questionId || !subject) return res.status(400).json({ error:"questionId and subject required" });
+
+  const alocSubject = ALOC_SUBJECT_MAP[subject?.toLowerCase()] || subject;
+
+  try {
+    const r = await fetch("https://questions.aloc.com.ng/api/r", {
+      method: "POST",
+      headers: { ...alocHeaders(), "Content-Type":"application/json" },
+      body: JSON.stringify({ subject: alocSubject, question_id: questionId, type, message }),
+    });
+    const data = await r.json();
+    console.log(`🚩 Question ${questionId} reported: type=${type}`);
+    res.json({ success: true, data });
+  } catch(e) {
+    console.error("Report question failed:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── CACHE STATS ────────────────────────────────────────────────────────────────
+app.get("/cache-stats", (req, res) => {
+  res.json({ status:"✅", cache: cacheStats() });
+});
+
 // ── HEALTH CHECK ──────────────────────────────────────────────────────────────
 app.get("/", (req, res) => {
   res.json({
@@ -782,6 +1067,229 @@ app.get("/", (req, res) => {
     aloc_years:    "2001 – 2020",
     aloc_types:    "utme (JAMB), wassce (WAEC/NECO)",
   });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// AUTH ENDPOINTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── REGISTER ─────────────────────────────────────────────────────────────────
+app.post("/api/auth/register", async (req, res) => {
+  const { name, email, password, exam, subjects=[], state="" } = req.body;
+  if(!name||!email||!password) return res.status(400).json({error:"Name, email and password required"});
+  if(password.length < 6)      return res.status(400).json({error:"Password must be at least 6 characters"});
+
+  const db = readDB();
+  if(db.users[email.toLowerCase()]) return res.status(409).json({error:"Email already registered"});
+
+  const hash = await bcrypt.hash(password, 10);
+  const userId = `u_${Date.now()}_${Math.random().toString(36).slice(2,7)}`;
+  const profile = {
+    userId, name, email:email.toLowerCase(), hash,
+    exam: exam||"WAEC", subjects, state,
+    xp:25, xpLog:[{reason:"Welcome bonus",amount:25,ts:Date.now()}],
+    achievements:[],
+    currentStreak:0, longestStreak:0, lastStudyDate:null, totalStudyDays:0,
+    stats:{
+      quizzesCompleted:0, cbtCompleted:0, totalAnswered:0,
+      totalCorrect:0, bestJAMB:0, subjectsPracticed:{},
+      longestStreak:0, reviewsCompleted:0,
+    },
+    history:[],
+    createdAt: new Date().toISOString(),
+  };
+  db.users[email.toLowerCase()] = profile;
+  writeDB(db);
+
+  const token = jwt.sign({userId, email:email.toLowerCase(), name}, JWT_SECRET, {expiresIn:"30d"});
+  const levelInfo = getLevel(25);
+  res.json({
+    token, user:{ userId, name, email:email.toLowerCase(), exam, subjects, state,
+      xp:25, level:levelInfo, achievements:[], currentStreak:0, longestStreak:0,
+      stats:profile.stats, createdAt:profile.createdAt },
+    newlyEarned: [],
+    message:`Welcome to ExamAce AI, ${name}! 🎉 +25 XP welcome bonus`,
+  });
+});
+
+// ── LOGIN ─────────────────────────────────────────────────────────────────────
+app.post("/api/auth/login", async (req, res) => {
+  const { email, password } = req.body;
+  if(!email||!password) return res.status(400).json({error:"Email and password required"});
+
+  const db = readDB();
+  const profile = db.users[email.toLowerCase()];
+  if(!profile) return res.status(401).json({error:"Email not found"});
+
+  const ok = await bcrypt.compare(password, profile.hash);
+  if(!ok) return res.status(401).json({error:"Wrong password"});
+
+  // Update streak on login
+  const { profile: updated, bonus } = updateStreak(profile);
+  const { profile: withAch, earned } = checkAchievements(updated);
+  db.users[email.toLowerCase()] = withAch;
+  writeDB(db);
+
+  const token = jwt.sign({userId:profile.userId, email:email.toLowerCase(), name:profile.name}, JWT_SECRET, {expiresIn:"30d"});
+  const levelInfo = getLevel(withAch.xp);
+
+  res.json({
+    token,
+    user:{ userId:profile.userId, name:profile.name, email:email.toLowerCase(),
+      exam:profile.exam, subjects:profile.subjects||[], state:profile.state||"",
+      xp:withAch.xp, level:levelInfo, achievements:withAch.achievements,
+      currentStreak:withAch.currentStreak, longestStreak:withAch.longestStreak,
+      lastStudyDate:withAch.lastStudyDate, totalStudyDays:withAch.totalStudyDays,
+      stats:withAch.stats, createdAt:profile.createdAt },
+    newlyEarned: earned,
+    streakBonus: bonus,
+  });
+});
+
+// ── GET PROFILE ───────────────────────────────────────────────────────────────
+app.get("/api/profile", auth, (req, res) => {
+  const db = readDB();
+  const profile = db.users[req.user.email];
+  if(!profile) return res.status(404).json({error:"Profile not found"});
+  const levelInfo = getLevel(profile.xp||0);
+  res.json({
+    userId:profile.userId, name:profile.name, email:profile.email,
+    exam:profile.exam, subjects:profile.subjects||[], state:profile.state||"",
+    xp:profile.xp||0, level:levelInfo, achievements:profile.achievements||[],
+    currentStreak:profile.currentStreak||0, longestStreak:profile.longestStreak||0,
+    lastStudyDate:profile.lastStudyDate, totalStudyDays:profile.totalStudyDays||0,
+    stats:profile.stats||{}, createdAt:profile.createdAt,
+    xpLog:(profile.xpLog||[]).slice(0,20),
+  });
+});
+
+// ── UPDATE PROFILE ────────────────────────────────────────────────────────────
+app.put("/api/profile", auth, (req, res) => {
+  const { name, exam, subjects, state } = req.body;
+  const db = readDB();
+  const profile = db.users[req.user.email];
+  if(!profile) return res.status(404).json({error:"Profile not found"});
+  if(name) profile.name = name;
+  if(exam) profile.exam = exam;
+  if(subjects) profile.subjects = subjects;
+  if(state !== undefined) profile.state = state;
+  db.users[req.user.email] = profile;
+  writeDB(db);
+  res.json({success:true, message:"Profile updated"});
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// STUDY HISTORY & PROGRESS ENDPOINTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── SAVE QUIZ/CBT RESULT ──────────────────────────────────────────────────────
+app.post("/api/progress/save", auth, (req, res) => {
+  const { type, exam, subject, year, score, total, pct, jambScore,
+          subjectBreakdown, qtype, wrongQuestions=[] } = req.body;
+
+  const db = readDB();
+  const profile = db.users[req.user.email];
+  if(!profile) return res.status(404).json({error:"Profile not found"});
+
+  // Update streak
+  const { profile: p1 } = updateStreak(profile);
+
+  // Award XP
+  const xpGained = [];
+  p1.stats = p1.stats || {};
+  const extras = [];
+
+  if(type === "quiz") {
+    const correct = Math.round((pct/100)*total);
+    p1.stats.quizzesCompleted = (p1.stats.quizzesCompleted||0)+1;
+    p1.stats.totalAnswered    = (p1.stats.totalAnswered||0)+total;
+    p1.stats.totalCorrect     = (p1.stats.totalCorrect||0)+correct;
+    if(subject) p1.stats.subjectsPracticed = {...(p1.stats.subjectsPracticed||{}), [subject]: (p1.stats.subjectsPracticed?.[subject]||0)+1};
+
+    // XP awards
+    awardXP(p1, `Quiz: ${subject||""}`, (correct*XP_RULES.correct) + ((total-correct)*XP_RULES.wrong));
+    awardXP(p1, "Quiz completed", XP_RULES.quiz_done);
+    if(pct===100){ awardXP(p1,"Perfect score!",XP_RULES.perfect_score); extras.push("perfect_quiz"); }
+    if(pct>=75)   extras.push("waec_a1");
+
+  } else if(type === "cbt") {
+    p1.stats.cbtCompleted  = (p1.stats.cbtCompleted||0)+1;
+    p1.stats.bestJAMB      = Math.max(p1.stats.bestJAMB||0, jambScore||0);
+    const totalQ  = subjectBreakdown?.reduce((s,x)=>s+x.total,0)||0;
+    const totalC  = subjectBreakdown?.reduce((s,x)=>s+x.correct,0)||0;
+    p1.stats.totalAnswered = (p1.stats.totalAnswered||0)+totalQ;
+    p1.stats.totalCorrect  = (p1.stats.totalCorrect||0)+totalC;
+    (subjectBreakdown||[]).forEach(sb => {
+      if(sb.name) p1.stats.subjectsPracticed = {...(p1.stats.subjectsPracticed||{}), [sb.name]: (p1.stats.subjectsPracticed?.[sb.name]||0)+1};
+    });
+    awardXP(p1, `JAMB CBT: ${jambScore}/400`, (totalC*XP_RULES.correct)+((totalQ-totalC)*XP_RULES.wrong));
+    awardXP(p1, "CBT completed", XP_RULES.cbt_done);
+    if(jambScore>=280) extras.push("cbt_280");
+    if(jambScore>=300) extras.push("cbt_300");
+  }
+
+  p1.stats.longestStreak = p1.longestStreak||0;
+
+  // Check achievements
+  const { profile: p2, earned } = checkAchievements(p1, extras);
+
+  // Save to history (keep last 200 sessions)
+  const historyEntry = {
+    id:`h_${Date.now()}`, type, exam, subject, year, score, total, pct,
+    jambScore, subjectBreakdown, qtype, wrongQuestions,
+    xpEarned: (p2.xpLog||[]).slice(0,5).reduce((s,x)=>s+x.amount,0),
+    ts: Date.now(),
+  };
+  p2.history = [historyEntry, ...(p2.history||[])].slice(0,200);
+
+  db.users[req.user.email] = p2;
+  writeDB(db);
+
+  const levelInfo = getLevel(p2.xp||0);
+  const prevLevel = getLevel((p2.xp||0) - (p2.xpLog?.[0]?.amount||0));
+  const levelUp   = levelInfo.level > prevLevel.level;
+
+  res.json({
+    success:true,
+    xp: p2.xp,
+    level: levelInfo,
+    levelUp,
+    newlyEarned: earned,
+    currentStreak: p2.currentStreak,
+    longestStreak: p2.longestStreak,
+  });
+});
+
+// ── GET HISTORY ───────────────────────────────────────────────────────────────
+app.get("/api/progress/history", auth, (req, res) => {
+  const { limit=50, type } = req.query;
+  const db = readDB();
+  const profile = db.users[req.user.email];
+  if(!profile) return res.status(404).json({error:"Profile not found"});
+
+  let history = profile.history||[];
+  if(type) history = history.filter(h => h.type===type);
+  history = history.slice(0, parseInt(limit));
+
+  res.json({ history, total: (profile.history||[]).length });
+});
+
+// ── LEADERBOARD ───────────────────────────────────────────────────────────────
+app.get("/api/leaderboard", (req, res) => {
+  const { limit=20 } = req.query;
+  const db = readDB();
+  const board = Object.values(db.users)
+    .map(u => ({
+      name: u.name,
+      xp: u.xp||0,
+      level: getLevel(u.xp||0),
+      currentStreak: u.currentStreak||0,
+      stats: { quizzesCompleted: u.stats?.quizzesCompleted||0, bestJAMB: u.stats?.bestJAMB||0, totalAnswered: u.stats?.totalAnswered||0 },
+      joinedAt: u.createdAt,
+    }))
+    .sort((a,b) => b.xp - a.xp)
+    .slice(0, parseInt(limit));
+  res.json({ board });
 });
 
 // ── TEST ALOC CONNECTIVITY ────────────────────────────────────────────────────
