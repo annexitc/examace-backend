@@ -162,7 +162,7 @@ const ALLOWED_ORIGINS = [
   "http://localhost:5173",
   "http://localhost:5174",
   // Add your actual frontend Render URL below:
-  "https://examace-frontend.onrender.com",   // ← change this to your frontend URL
+  "https://examace-ai.onrender.com",   // ← change this to your frontend URL
   // If you have a custom domain, add it too:
   // "https://www.examace.ng",
 ];
