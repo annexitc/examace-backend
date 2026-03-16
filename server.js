@@ -69,14 +69,14 @@ const XP_RULES = {
 };
 
 const LEVELS = [
-  {level:1, name:"SS1 Starter",     minXP:0,    badge:"🌱", color:"#22c55e"},
-  {level:2, name:"SS1 Learner",     minXP:100,  badge:"📚", color:"#38bdf8"},
-  {level:3, name:"SS2 Scholar",     minXP:300,  badge:"⭐", color:"#a855f7"},
-  {level:4, name:"SS3 Candidate",   minXP:600,  badge:"🎯", color:"#f97316"},
-  {level:5, name:"WAEC Ready",      minXP:1000, badge:"🏅", color:"#f5c842"},
-  {level:6, name:"JAMB Champion",   minXP:1500, badge:"🏆", color:"#f5c842"},
-  {level:7, name:"A1 Legend",       minXP:2500, badge:"👑", color:"#ef4444"},
-  {level:8, name:"ExamAce Master",  minXP:4000, badge:"💎", color:"#a855f7"},
+  {level:1, name:"Rookie",       minXP:0,    badge:"🌱", color:"#22c55e"},
+  {level:2, name:"Explorer",     minXP:100,  badge:"🔍", color:"#38bdf8"},
+  {level:3, name:"Achiever",     minXP:300,  badge:"⭐", color:"#a855f7"},
+  {level:4, name:"Scholar",      minXP:600,  badge:"📖", color:"#f97316"},
+  {level:5, name:"Contender",    minXP:1000, badge:"🎯", color:"#f5c842"},
+  {level:6, name:"Champion",     minXP:1500, badge:"🏆", color:"#f5c842"},
+  {level:7, name:"Elite",        minXP:2500, badge:"👑", color:"#ef4444"},
+  {level:8, name:"ExamAce Pro",  minXP:4000, badge:"💎", color:"#a855f7"},
 ];
 
 const ACHIEVEMENTS = [
@@ -959,7 +959,8 @@ Return ONLY this JSON array:
   "topic": "Comprehension|Lexis & Structure|Oral English|Vocabulary",
   "year": "${year||"20XX"}",
   "difficulty": "easy|medium|hard",
-  "source": "AI"
+  "source": "AI-Generated",
+  "yearStyle": "${year ? year+"+" : "2021+"}"
 }]`;
 
   const system = `You are a ${examLabel} English Language examiner. Follow the official ${examLabel} English syllabus. ${NG_CONTEXT}`;
@@ -982,7 +983,7 @@ Return ONLY this JSON array:
       const parsed = JSON.parse(clean.slice(start, end+1));
       if (Array.isArray(parsed) && parsed.length > 0) {
         console.log(`✅ ${name} generated ${parsed.length} English questions with passages`);
-        return parsed.slice(0, count).map(q => ({...q, source:"AI", aiModel:name}));
+        return parsed.slice(0, count).map(q => ({...q, source:"AI-Generated", yearStyle:q.yearStyle||(q.year?q.year+"+":"2021+"), aiModel:name}));
       }
     } catch(e) { console.error(`❌ ${name} English gen:`, e.message); }
   }
@@ -1010,7 +1011,7 @@ const generateQuestionsAI = async (subject, examType, year, count) => {
       const parsed = JSON.parse(clean.slice(start, end+1));
       if (Array.isArray(parsed) && parsed.length > 0) {
         console.log(`✅ ${name} generated ${parsed.length} questions`);
-        return { questions: parsed.slice(0,count).map(q=>({...q,source:"AI",aiModel:name})), source:name };
+        return { questions: parsed.slice(0,count).map(q=>({...q,source:"AI-Generated",yearStyle:q.yearStyle||(q.year?q.year+"+":"2021+"),aiModel:name})), source:name };
       }
     } catch(e) { console.error(`❌ ${name} qgen:`, e.message); }
   }
